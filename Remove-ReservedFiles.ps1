@@ -32,6 +32,18 @@
 .PARAMETER OutputFormat
     Output format for results: Table (default), CSV, or JSON.
 
+.PARAMETER Quiet
+    Suppress banner and non-essential output (for scripting).
+
+.PARAMETER Retry
+    Number of retry attempts for locked files (default: 0).
+
+.PARAMETER RetryDelay
+    Delay in seconds between retry attempts (default: 2).
+
+.PARAMETER Version
+    Display version information and exit.
+
 .PARAMETER Verbose
     Show detailed scanning progress.
 
@@ -50,6 +62,14 @@
 .EXAMPLE
     .\Remove-ReservedFiles.ps1 -List -OutputFormat JSON -LogFile "scan.log"
     Lists files in JSON format and writes log to scan.log.
+
+.EXAMPLE
+    .\Remove-ReservedFiles.ps1 -Force -Retry 3 -RetryDelay 5
+    Delete all files, retrying locked files up to 3 times with 5 second delays.
+
+.EXAMPLE
+    .\Remove-ReservedFiles.ps1 -List -Quiet -OutputFormat JSON
+    Quiet mode for scripting - outputs only JSON data.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -61,8 +81,18 @@ param(
     [string[]]$Exclude,
     [string]$LogFile,
     [ValidateSet('Table', 'CSV', 'JSON')]
-    [string]$OutputFormat = 'Table'
+    [string]$OutputFormat = 'Table',
+    [switch]$Quiet,
+    [ValidateRange(0, 10)]
+    [int]$Retry = 0,
+    [ValidateRange(1, 60)]
+    [int]$RetryDelay = 2,
+    [switch]$Version
 )
+
+# Script version
+$Script:ScriptVersion = "1.0.0"
+$Script:REPO_URL = "https://github.com/RicherTunes/windows-reserved-file-cleaner"
 
 # Exit codes
 $Script:EXIT_SUCCESS = 0
@@ -78,14 +108,24 @@ $Script:LogBuffer = [System.Collections.ArrayList]::new()
 
 #region ASCII Art and Display Functions
 
+function Show-Version {
+    Write-Host "Windows Reserved File Cleaner v$Script:ScriptVersion"
+    Write-Host "Repository: $Script:REPO_URL"
+    Write-Host ""
+    Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+    Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
+}
+
 function Show-Banner {
+    if ($Script:Quiet) { return }
+
     $cyan = [ConsoleColor]::Cyan
     $white = [ConsoleColor]::White
     $gray = [ConsoleColor]::Gray
 
     Write-Host ""
     Write-Host "  ================================================================" -ForegroundColor $cyan
-    Write-Host "      WINDOWS RESERVED FILE CLEANER" -ForegroundColor $white
+    Write-Host "      WINDOWS RESERVED FILE CLEANER v$Script:ScriptVersion" -ForegroundColor $white
     Write-Host "  ================================================================" -ForegroundColor $cyan
     Write-Host ""
     Write-Host "      _   _ _   _ _        ____ _     _____    _    _   _ _____ ____  " -ForegroundColor $cyan
@@ -103,15 +143,17 @@ function Write-Step {
     param(
         [string]$Icon,
         [string]$Message,
-        [ConsoleColor]$Color = [ConsoleColor]::White
+        [ConsoleColor]$Color = [ConsoleColor]::White,
+        [switch]$Force  # Show even in quiet mode
     )
+    if ($Script:Quiet -and -not $Force) { return }
     Write-Host "  $Icon " -ForegroundColor $Color -NoNewline
     Write-Host $Message
 }
 
-function Write-Success { param([string]$Message) Write-Step "[OK]" $Message ([ConsoleColor]::Green) }
-function Write-Info    { param([string]$Message) Write-Step "[i]" $Message ([ConsoleColor]::Cyan) }
-function Write-Warn    { param([string]$Message) Write-Step "[!]" $Message ([ConsoleColor]::Yellow) }
+function Write-Success { param([string]$Message, [switch]$Force) Write-Step "[OK]" $Message ([ConsoleColor]::Green) -Force:$Force }
+function Write-Info    { param([string]$Message, [switch]$Force) Write-Step "[i]" $Message ([ConsoleColor]::Cyan) -Force:$Force }
+function Write-Warn    { param([string]$Message, [switch]$Force) Write-Step "[!]" $Message ([ConsoleColor]::Yellow) -Force:$Force }
 function Write-Err     { param([string]$Message) Write-Step "[X]" $Message ([ConsoleColor]::Red) }
 
 function Write-Log {
@@ -255,7 +297,9 @@ function Find-ReservedFiles {
 function Remove-ReservedFile {
     param(
         [string]$FilePath,
-        [switch]$IsReadOnly
+        [switch]$IsReadOnly,
+        [int]$RetryCount = 0,
+        [int]$RetryDelaySeconds = 2
     )
 
     # Validate path before passing to cmd.exe
@@ -272,66 +316,92 @@ function Remove-ReservedFile {
     # PowerShell's Remove-Item doesn't support \\?\ prefix, so use cmd.exe
     $ntPath = "\\?\$FilePath"
 
-    try {
-        # Handle read-only files with /a flag
-        $delFlags = "/f /q"
-        if ($IsReadOnly) {
-            $delFlags = "/f /q /a"
-            Write-Log "File is read-only, using /a flag: $FilePath"
+    $attempt = 0
+    $maxAttempts = $RetryCount + 1
+
+    while ($attempt -lt $maxAttempts) {
+        $attempt++
+
+        try {
+            # Handle read-only files with /a flag
+            $delFlags = "/f /q"
+            if ($IsReadOnly) {
+                $delFlags = "/f /q /a"
+                Write-Log "File is read-only, using /a flag: $FilePath"
+            }
+
+            $output = cmd /c "del $delFlags `"$ntPath`"" 2>&1
+
+            # Check for specific error conditions
+            if ($LASTEXITCODE -ne 0) {
+                $errorMsg = $output -join ' '
+                $isLocked = $errorMsg -match 'being used by another process'
+                $isAccessDenied = $errorMsg -match 'Access is denied'
+
+                # Retry logic for locked files
+                if ($isLocked -and $attempt -lt $maxAttempts) {
+                    Write-Log "File locked, attempt $attempt of $maxAttempts. Retrying in $RetryDelaySeconds seconds: $FilePath" 'WARN'
+                    if (-not $Script:Quiet) {
+                        Write-Host "         Retry $attempt/$maxAttempts in ${RetryDelaySeconds}s (file locked)..." -ForegroundColor Gray
+                    }
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                    continue
+                }
+
+                if ($isLocked) {
+                    return @{
+                        Success = $false
+                        Error   = "File is locked by another application. Close any programs using this file and try again."
+                        Status  = 'Locked'
+                    }
+                }
+                elseif ($isAccessDenied) {
+                    return @{
+                        Success = $false
+                        Error   = "Access denied. Try running PowerShell as Administrator."
+                        Status  = 'AccessDenied'
+                    }
+                }
+                else {
+                    return @{
+                        Success = $false
+                        Error   = "Deletion failed: $errorMsg"
+                        Status  = 'Failed'
+                    }
+                }
+            }
+
+            # Verify the file was actually deleted
+            if (Test-Path -LiteralPath $FilePath) {
+                return @{
+                    Success = $false
+                    Error   = "File still exists after deletion attempt. It may be locked or protected."
+                    Status  = 'StillExists'
+                }
+            }
+
+            Write-Log "Deleted: $FilePath"
+            return @{
+                Success = $true
+                Error   = $null
+                Status  = 'Deleted'
+            }
         }
-
-        $output = cmd /c "del $delFlags `"$ntPath`"" 2>&1
-
-        # Check for specific error conditions
-        if ($LASTEXITCODE -ne 0) {
-            $errorMsg = $output -join ' '
-
-            if ($errorMsg -match 'being used by another process') {
-                return @{
-                    Success = $false
-                    Error   = "File is locked by another application. Close any programs using this file and try again."
-                    Status  = 'Locked'
-                }
-            }
-            elseif ($errorMsg -match 'Access is denied') {
-                return @{
-                    Success = $false
-                    Error   = "Access denied. Try running PowerShell as Administrator."
-                    Status  = 'AccessDenied'
-                }
-            }
-            else {
-                return @{
-                    Success = $false
-                    Error   = "Deletion failed: $errorMsg"
-                    Status  = 'Failed'
-                }
-            }
-        }
-
-        # Verify the file was actually deleted
-        if (Test-Path -LiteralPath $FilePath) {
+        catch {
+            Write-Log "Exception deleting ${FilePath}: $_" 'ERROR'
             return @{
                 Success = $false
-                Error   = "File still exists after deletion attempt. It may be locked or protected."
-                Status  = 'StillExists'
+                Error   = $_.Exception.Message
+                Status  = 'Exception'
             }
         }
-
-        Write-Log "Deleted: $FilePath"
-        return @{
-            Success = $true
-            Error   = $null
-            Status  = 'Deleted'
-        }
     }
-    catch {
-        Write-Log "Exception deleting ${FilePath}: $_" 'ERROR'
-        return @{
-            Success = $false
-            Error   = $_.Exception.Message
-            Status  = 'Exception'
-        }
+
+    # Should not reach here, but just in case
+    return @{
+        Success = $false
+        Error   = "Unexpected error during deletion"
+        Status  = 'Unknown'
     }
 }
 
@@ -350,21 +420,53 @@ function Show-Results {
         [string]$Format = 'Table'
     )
 
-    Write-Host ""
-    Write-Host "  ================================================================" -ForegroundColor Cyan
-    Write-Host "                         SCAN RESULTS" -ForegroundColor White
-    Write-Host "  ================================================================" -ForegroundColor Cyan
-    Write-Host ""
+    # In quiet mode with JSON/CSV, output only the data
+    if ($Script:Quiet -and $Format -ne 'Table') {
+        if ($Files.Count -eq 0) {
+            switch ($Format) {
+                'CSV' { Write-Output '"Name","Path","Size","Modified","ReadOnly","Attributes"' }
+                'JSON' { Write-Output '[]' }
+            }
+            return
+        }
+
+        $outputData = $Files | ForEach-Object {
+            [PSCustomObject]@{
+                Name       = $_.Name
+                Path       = $_.Path
+                Size       = $_.Size
+                Modified   = $_.Modified.ToString("yyyy-MM-dd HH:mm:ss")
+                ReadOnly   = $_.ReadOnly
+                Attributes = $_.Attributes
+            }
+        }
+
+        switch ($Format) {
+            'CSV' { $outputData | ConvertTo-Csv -NoTypeInformation }
+            'JSON' { $outputData | ConvertTo-Json -Depth 2 }
+        }
+        return
+    }
+
+    if (-not $Script:Quiet) {
+        Write-Host ""
+        Write-Host "  ================================================================" -ForegroundColor Cyan
+        Write-Host "                         SCAN RESULTS" -ForegroundColor White
+        Write-Host "  ================================================================" -ForegroundColor Cyan
+        Write-Host ""
+    }
 
     if ($Files.Count -eq 0) {
         Write-Success "No reserved-name files found. Your system is clean!"
         return
     }
 
-    Write-Host "  Found " -NoNewline
-    Write-Host "$($Files.Count)" -ForegroundColor Yellow -NoNewline
-    Write-Host " reserved-name file(s):"
-    Write-Host ""
+    if (-not $Script:Quiet) {
+        Write-Host "  Found " -NoNewline
+        Write-Host "$($Files.Count)" -ForegroundColor Yellow -NoNewline
+        Write-Host " reserved-name file(s):"
+        Write-Host ""
+    }
 
     switch ($Format) {
         'CSV' {
@@ -481,12 +583,21 @@ function Save-Log {
 
 #region Main Logic
 
+# Set script-level quiet flag
+$Script:Quiet = $Quiet
+
+# Handle version request
+if ($Version) {
+    Show-Version
+    exit $EXIT_SUCCESS
+}
+
 # Show banner
 Show-Banner
 
 # Log start
-Write-Log "=== Windows Reserved File Cleaner started ==="
-$paramString = "Path=$Path, List=$List, Interactive=$Interactive, Force=$Force, Exclude=$Exclude"
+Write-Log "=== Windows Reserved File Cleaner v$Script:ScriptVersion started ==="
+$paramString = "Path=$Path, List=$List, Interactive=$Interactive, Force=$Force, Exclude=$Exclude, Retry=$Retry"
 Write-Log "Parameters: $paramString"
 
 # Admin and system drive warning
@@ -597,7 +708,7 @@ if ($Force) {
     Write-Host ""
 
     foreach ($file in $files) {
-        $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly
+        $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
         if ($result.Success) {
             Write-Success "Deleted: $($file.Path)"
             $deleted++
@@ -636,7 +747,7 @@ elseif ($Interactive) {
 
         switch -Regex ($choice) {
             '^[Yy]' {
-                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly
+                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
                 if ($result.Success) {
                     Write-Success "Deleted: $($file.Path)"
                     $deleted++
@@ -650,7 +761,7 @@ elseif ($Interactive) {
             }
             '^[Aa]' {
                 $deleteAll = $true
-                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly
+                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
                 if ($result.Success) {
                     Write-Success "Deleted: $($file.Path)"
                     $deleted++
@@ -685,7 +796,7 @@ else {
     if ($response -match '^[Yy]') {
         Write-Host ""
         foreach ($file in $files) {
-            $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly
+            $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
             if ($result.Success) {
                 Write-Success "Deleted: $($file.Path)"
                 $deleted++

@@ -147,6 +147,10 @@ cd windows-reserved-file-cleaner
 | `-Exclude` | string[] | Patterns to exclude (e.g., "node_modules"). |
 | `-LogFile` | string | Path to save detailed log file. |
 | `-OutputFormat` | string | Output format: Table (default), CSV, or JSON. |
+| `-Quiet` | switch | Suppress banner and decorations (for scripting). |
+| `-Retry` | int | Retry attempts for locked files (0-10, default: 0). |
+| `-RetryDelay` | int | Seconds between retries (1-60, default: 2). |
+| `-Version` | switch | Display version information and exit. |
 | `-Verbose` | switch | Show detailed scanning progress. |
 
 ---
