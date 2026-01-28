@@ -11,7 +11,7 @@
 #>
 
 # Module version
-$Script:ModuleVersion = '1.1.0'
+$Script:ModuleVersion = '1.2.0'
 
 # Reserved device names (22 total)
 $Script:ReservedNames = @('NUL', 'CON', 'PRN', 'AUX') +
@@ -30,6 +30,33 @@ function Format-FileSize {
 function Test-IsReservedName {
     param([string]$Name)
     return $Name -in $Script:ReservedNames
+}
+
+function Test-SafePath {
+    <#
+    .SYNOPSIS
+        Validates a path for security concerns. Throws if path is invalid.
+    #>
+    param([string]$Path)
+
+    # Check for dangerous characters that could enable command injection
+    $dangerousChars = @(';', '|', '&', '`', '$', '>', '<', '!', '{', '}')
+    foreach ($char in $dangerousChars) {
+        if ($Path.Contains($char)) {
+            throw "Invalid path: contains potentially dangerous character '$char'"
+        }
+    }
+    # No return value - just throws on error
+}
+
+function Test-ReservedFileExists {
+    <#
+    .SYNOPSIS
+        Tests if a reserved-name file exists using the extended path prefix.
+    #>
+    param([string]$FilePath)
+    $ntPath = "\\?\$FilePath"
+    return [System.IO.File]::Exists($ntPath)
 }
 
 #endregion
@@ -77,6 +104,9 @@ function Find-ReservedFiles {
     $results = [System.Collections.ArrayList]::new()
 
     foreach ($scanPath in $Path) {
+        # Validate path for security
+        Test-SafePath -Path $scanPath
+
         if (-not (Test-Path -LiteralPath $scanPath)) { continue }
 
         $gciParams = @{
@@ -133,6 +163,9 @@ function Remove-ReservedFile {
     .PARAMETER UseRecycleBin
         Move to Recycle Bin instead of permanent deletion.
 
+    .PARAMETER BackupPath
+        Copy the file to this directory before deletion.
+
     .PARAMETER Force
         Skip confirmation prompts.
 
@@ -141,6 +174,9 @@ function Remove-ReservedFile {
 
     .EXAMPLE
         Remove-ReservedFile -Path "D:\Projects\nul" -UseRecycleBin
+
+    .EXAMPLE
+        Remove-ReservedFile -Path "D:\Projects\nul" -BackupPath "C:\Backup"
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -148,13 +184,47 @@ function Remove-ReservedFile {
         [string]$Path,
 
         [switch]$UseRecycleBin,
+        [string]$BackupPath,
         [switch]$Force
     )
 
     process {
-        if (-not (Test-Path -LiteralPath $Path)) {
-            Write-Error "File not found: $Path"
-            return
+        $result = [PSCustomObject]@{
+            Path = $Path
+            Success = $false
+            Error = $null
+        }
+
+        # Skip if Path is empty
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            $result.Error = "Path cannot be empty"
+            Write-Error $result.Error
+            return $result
+        }
+
+        # Use extended path to check existence for reserved names
+        $ntPath = "\\?\$Path"
+        if (-not [System.IO.File]::Exists($ntPath)) {
+            $result.Error = "File not found: $Path"
+            Write-Error $result.Error
+            return $result
+        }
+
+        # Backup if requested (check for non-empty string)
+        if (-not [string]::IsNullOrWhiteSpace($BackupPath)) {
+            if (-not (Test-Path $BackupPath)) {
+                New-Item -ItemType Directory -Path $BackupPath -Force | Out-Null
+            }
+            $fileName = [System.IO.Path]::GetFileName($Path)
+            $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $backupFile = Join-Path $BackupPath "${timestamp}_${fileName}"
+            try {
+                cmd /c "copy `"$ntPath`" `"$backupFile`"" 2>$null
+                Write-Verbose "Backed up to: $backupFile"
+            }
+            catch {
+                Write-Warning "Backup failed: $_"
+            }
         }
 
         if ($UseRecycleBin) {
@@ -166,23 +236,27 @@ function Remove-ReservedFile {
                     [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
                 )
                 Write-Verbose "Moved to Recycle Bin: $Path"
-                return
+                $result.Success = $true
+                return $result
             }
             catch {
                 Write-Warning "Recycle Bin failed, trying direct delete"
             }
         }
 
-        $ntPath = "\\?\$Path"
         if ($PSCmdlet.ShouldProcess($Path, "Delete")) {
             $output = cmd /c "del /f /q /a `"$ntPath`"" 2>&1
-            if (Test-Path -LiteralPath $Path) {
-                Write-Error "Failed to delete: $Path"
+            if ([System.IO.File]::Exists($ntPath)) {
+                $result.Error = "Failed to delete: $Path"
+                Write-Error $result.Error
             }
             else {
                 Write-Verbose "Deleted: $Path"
+                $result.Success = $true
             }
         }
+
+        return $result
     }
 }
 
@@ -229,38 +303,60 @@ function Remove-ReservedFiles {
         [int]$MaxDepth = 0
     )
 
+    $result = [PSCustomObject]@{
+        Found = 0
+        Deleted = 0
+        Failed = 0
+        Files = @()
+    }
+
     $files = Find-ReservedFiles -Path $Path -Exclude $Exclude -MaxDepth $MaxDepth
+    $result.Found = $files.Count
+    $result.Files = $files
 
     if ($files.Count -eq 0) {
         Write-Host "No reserved-name files found." -ForegroundColor Green
-        return
+        return $result
     }
 
     Write-Host "Found $($files.Count) reserved-name file(s):" -ForegroundColor Yellow
-    $files | Format-Table Name, @{L='Size';E={Format-FileSize $_.Size}}, Path -AutoSize
 
     if (-not $Force -and -not $WhatIfPreference) {
         $confirm = Read-Host "Delete all files? [Y]es/[N]o"
         if ($confirm -notmatch '^[Yy]') {
             Write-Host "Cancelled." -ForegroundColor Yellow
-            return
+            return $result
         }
     }
 
-    $deleted = 0
     foreach ($file in $files) {
-        if ($BackupPath) {
-            $backupFile = Join-Path $BackupPath "$($file.Name)_$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-            Copy-Item -LiteralPath "\\?\$($file.Path)" -Destination $backupFile -Force -ErrorAction SilentlyContinue
+        # Skip files with empty or null paths
+        if ([string]::IsNullOrWhiteSpace($file.Path)) {
+            $result.Failed++
+            continue
         }
 
         if ($PSCmdlet.ShouldProcess($file.Path, "Delete")) {
-            Remove-ReservedFile -Path $file.Path -UseRecycleBin:$UseRecycleBin -Force
-            $deleted++
+            $removeParams = @{
+                Path = $file.Path
+                UseRecycleBin = $UseRecycleBin.IsPresent
+                Force = $true
+            }
+            if ($BackupPath) {
+                $removeParams['BackupPath'] = $BackupPath
+            }
+            $deleteResult = Remove-ReservedFile @removeParams
+            if ($deleteResult.Success) {
+                $result.Deleted++
+            }
+            else {
+                $result.Failed++
+            }
         }
     }
 
-    Write-Host "Deleted $deleted file(s)." -ForegroundColor Green
+    Write-Host "Deleted $($result.Deleted) file(s)." -ForegroundColor Green
+    return $result
 }
 
 function Install-ReservedFileWatcher {
@@ -478,26 +574,41 @@ function New-ReservedFileReport {
         Generates an HTML report of reserved files found.
 
     .PARAMETER Path
-        Paths to scan.
+        Paths to scan. Not required if -Files is provided.
+
+    .PARAMETER Files
+        Pre-scanned file objects to include in the report.
 
     .PARAMETER OutputPath
         Where to save the HTML report.
 
     .PARAMETER Exclude
-        Patterns to exclude.
+        Patterns to exclude when scanning.
 
     .EXAMPLE
         New-ReservedFileReport -Path "D:\Projects" -OutputPath "report.html"
+
+    .EXAMPLE
+        $files = Find-ReservedFiles -Path "D:\Projects"
+        New-ReservedFileReport -Files $files -OutputPath "report.html"
     #>
     [CmdletBinding()]
     param(
         [string[]]$Path,
+        [Parameter(ValueFromPipeline)]
+        [object[]]$Files,
         [Parameter(Mandatory)]
         [string]$OutputPath,
         [string[]]$Exclude
     )
 
-    $files = Find-ReservedFiles -Path $Path -Exclude $Exclude
+    # If Files not provided, scan the paths
+    if (-not $Files -or $Files.Count -eq 0) {
+        $files = Find-ReservedFiles -Path $Path -Exclude $Exclude
+    }
+    else {
+        $files = $Files
+    }
     $scanDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $totalSize = ($files | Measure-Object -Property Size -Sum).Sum
 

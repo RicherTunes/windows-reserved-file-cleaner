@@ -17,6 +17,10 @@ BeforeAll {
     $ModulePath = Join-Path $PSScriptRoot '..\ReservedFileCleaner\ReservedFileCleaner.psm1'
     Import-Module $ModulePath -Force
 
+    # Reserved names list for cleanup
+    $Script:ReservedNamesForCleanup = @('NUL', 'CON', 'PRN', 'AUX') +
+                                       (1..9 | ForEach-Object { "COM$_"; "LPT$_" })
+
     # Create a test directory for our tests
     $Script:TestRoot = Join-Path $env:TEMP "ReservedFileCleaner-Tests-$(Get-Random)"
     New-Item -Path $Script:TestRoot -ItemType Directory -Force | Out-Null
@@ -47,7 +51,32 @@ BeforeAll {
         param([string]$FilePath)
         $ntPath = "\\?\$FilePath"
         if ([System.IO.File]::Exists($ntPath)) {
-            cmd /c "del /f /q `"$ntPath`"" 2>$null
+            cmd /c "del /f /q /a `"$ntPath`"" 2>$null
+        }
+    }
+
+    # Cleanup function that removes all reserved files from a directory
+    function Clear-ReservedTestFiles {
+        param([string]$Directory)
+        if (-not (Test-Path $Directory)) { return }
+
+        # Get all subdirectories including the root
+        $dirs = @($Directory) + (Get-ChildItem -Path $Directory -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+
+        foreach ($dir in $dirs) {
+            foreach ($name in $Script:ReservedNamesForCleanup) {
+                $filePath = Join-Path $dir $name
+                $ntPath = "\\?\$filePath"
+                if ([System.IO.File]::Exists($ntPath)) {
+                    cmd /c "del /f /q /a `"$ntPath`"" 2>$null
+                }
+                # Also check lowercase
+                $filePathLower = Join-Path $dir $name.ToLower()
+                $ntPathLower = "\\?\$filePathLower"
+                if ([System.IO.File]::Exists($ntPathLower)) {
+                    cmd /c "del /f /q /a `"$ntPathLower`"" 2>$null
+                }
+            }
         }
     }
 }
@@ -56,10 +85,8 @@ AfterAll {
     # Clean up test directory
     if (Test-Path $Script:TestRoot) {
         # First remove any reserved files that might remain
-        Get-ChildItem -Path $Script:TestRoot -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-            $ntPath = "\\?\$($_.FullName)"
-            cmd /c "del /f /q `"$ntPath`"" 2>$null
-        }
+        Clear-ReservedTestFiles -Directory $Script:TestRoot
+        Start-Sleep -Milliseconds 100  # Small delay to ensure files are released
         Remove-Item -Path $Script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -106,9 +133,7 @@ Describe "Find-ReservedFiles" {
     AfterAll {
         # Clean up
         if (Test-Path $Script:FindTestDir) {
-            Get-ChildItem -Path $Script:FindTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Remove-ReservedTestFile -FilePath $_.FullName
-            }
+            Clear-ReservedTestFiles -Directory $Script:FindTestDir
             Remove-Item -Path $Script:FindTestDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -123,9 +148,7 @@ Describe "Find-ReservedFiles" {
         AfterEach {
             # Clean up test files
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -185,28 +208,47 @@ Describe "Find-ReservedFiles" {
         }
 
         It "Should be case-insensitive" {
-            $nulUpper = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "NUL"
+            # Create a fresh isolated directory for this specific test
+            $isolatedDir = Join-Path $env:TEMP "RFC-CaseTest-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory $isolatedDir -Name "NUL" | Out-Null
 
-            $results = Find-ReservedFiles -Path $Script:CurrentTestDir
+                $results = Find-ReservedFiles -Path $isolatedDir
 
-            $results | Should -Not -BeNullOrEmpty
-            $results.Count | Should -Be 1
+                $results | Should -Not -BeNullOrEmpty
+                $results.Count | Should -Be 1
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
 
         It "Should find multiple reserved files" {
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "con" | Out-Null
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "aux" | Out-Null
+            # Create a fresh isolated directory for this specific test
+            $isolatedDir = Join-Path $env:TEMP "RFC-MultiTest-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory $isolatedDir -Name "nul" | Out-Null
+                New-ReservedTestFile -Directory $isolatedDir -Name "con" | Out-Null
+                New-ReservedTestFile -Directory $isolatedDir -Name "aux" | Out-Null
 
-            $results = Find-ReservedFiles -Path $Script:CurrentTestDir
+                $results = Find-ReservedFiles -Path $isolatedDir
 
-            $results.Count | Should -Be 3
+                $results.Count | Should -Be 3
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
     Context "Non-Reserved Files" {
         BeforeEach {
-            $Script:CurrentTestDir = Join-Path $Script:FindTestDir "nonreserved-$(Get-Random)"
+            # Use a unique isolated directory for each test
+            $Script:CurrentTestDir = Join-Path $env:TEMP "RFC-NonReserved-$(Get-Random)"
             New-Item -Path $Script:CurrentTestDir -ItemType Directory -Force | Out-Null
         }
 
@@ -244,44 +286,48 @@ Describe "Find-ReservedFiles" {
     }
 
     Context "Exclusion Patterns" {
-        BeforeEach {
-            $Script:CurrentTestDir = Join-Path $Script:FindTestDir "exclude-$(Get-Random)"
-            New-Item -Path $Script:CurrentTestDir -ItemType Directory -Force | Out-Null
+        It "Should exclude specified directories" {
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Exclude1-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            New-Item -Path (Join-Path $isolatedDir "node_modules") -ItemType Directory -Force | Out-Null
+            New-Item -Path (Join-Path $isolatedDir "src") -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory (Join-Path $isolatedDir "node_modules") -Name "nul" | Out-Null
+                New-ReservedTestFile -Directory (Join-Path $isolatedDir "src") -Name "nul" | Out-Null
 
-            # Create subdirectories
-            New-Item -Path (Join-Path $Script:CurrentTestDir "node_modules") -ItemType Directory -Force | Out-Null
-            New-Item -Path (Join-Path $Script:CurrentTestDir ".git") -ItemType Directory -Force | Out-Null
-            New-Item -Path (Join-Path $Script:CurrentTestDir "src") -ItemType Directory -Force | Out-Null
-        }
+                $results = Find-ReservedFiles -Path $isolatedDir -Exclude "node_modules"
 
-        AfterEach {
-            if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
-                Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
+                $results.Count | Should -Be 1
+                $results[0].Path | Should -Match "src"
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
 
-        It "Should exclude specified directories" {
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "node_modules") -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "src") -Name "nul" | Out-Null
-
-            $results = Find-ReservedFiles -Path $Script:CurrentTestDir -Exclude "node_modules"
-
-            $results.Count | Should -Be 1
-            $results[0].Path | Should -Match "src"
-        }
-
         It "Should support multiple exclusion patterns" {
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "node_modules") -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir ".git") -Name "con" | Out-Null
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "src") -Name "aux" | Out-Null
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Exclude2-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            New-Item -Path (Join-Path $isolatedDir "node_modules") -ItemType Directory -Force | Out-Null
+            New-Item -Path (Join-Path $isolatedDir ".git") -ItemType Directory -Force | Out-Null
+            New-Item -Path (Join-Path $isolatedDir "src") -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory (Join-Path $isolatedDir "node_modules") -Name "nul" | Out-Null
+                New-ReservedTestFile -Directory (Join-Path $isolatedDir ".git") -Name "con" | Out-Null
+                New-ReservedTestFile -Directory (Join-Path $isolatedDir "src") -Name "aux" | Out-Null
 
-            $results = Find-ReservedFiles -Path $Script:CurrentTestDir -Exclude "node_modules", ".git"
+                $results = Find-ReservedFiles -Path $isolatedDir -Exclude "node_modules", ".git"
 
-            $results.Count | Should -Be 1
-            $results[0].Name | Should -Be "aux"
+                $results.Count | Should -Be 1
+                $results[0].Name | Should -Be "aux"
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
@@ -302,50 +348,72 @@ Describe "Find-ReservedFiles" {
 
         AfterEach {
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
 
-        It "Should respect MaxDepth parameter" {
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "level1") -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "level1\level2") -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory (Join-Path $Script:CurrentTestDir "level1\level2\level3") -Name "nul" | Out-Null
+        It "Should have MaxDepth parameter" {
+            $cmd = Get-Command -Name Find-ReservedFiles
+            $cmd.Parameters.ContainsKey('MaxDepth') | Should -BeTrue
+        }
 
-            $results = Find-ReservedFiles -Path $Script:CurrentTestDir -MaxDepth 2
+        It "Should accept MaxDepth as integer" {
+            $cmd = Get-Command -Name Find-ReservedFiles
+            $param = $cmd.Parameters['MaxDepth']
+            $param.ParameterType.Name | Should -Be 'Int32'
+        }
 
-            # Should find files at root (depth 1) and level1 (depth 2), but not deeper
-            $results.Count | Should -BeLessOrEqual 2
+        It "Should limit depth when MaxDepth is set" {
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Depth-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            $level1 = Join-Path $isolatedDir "level1"
+            $level2 = Join-Path $level1 "level2"
+            $level3 = Join-Path $level2 "level3"
+            New-Item -Path $level1 -ItemType Directory -Force | Out-Null
+            New-Item -Path $level2 -ItemType Directory -Force | Out-Null
+            New-Item -Path $level3 -ItemType Directory -Force | Out-Null
+
+            try {
+                # Create files at different depths
+                New-ReservedTestFile -Directory $isolatedDir -Name "nul" | Out-Null  # depth 0
+                New-ReservedTestFile -Directory $level1 -Name "nul" | Out-Null  # depth 1
+                New-ReservedTestFile -Directory $level2 -Name "nul" | Out-Null  # depth 2
+                New-ReservedTestFile -Directory $level3 -Name "nul" | Out-Null  # depth 3
+
+                # With MaxDepth=1, should find files at depth 0 and 1 only
+                $results = Find-ReservedFiles -Path $isolatedDir -MaxDepth 1
+
+                $results.Count | Should -Be 2
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
     Context "Output Properties" {
-        BeforeEach {
-            $Script:CurrentTestDir = Join-Path $Script:FindTestDir "props-$(Get-Random)"
-            New-Item -Path $Script:CurrentTestDir -ItemType Directory -Force | Out-Null
-        }
-
-        AfterEach {
-            if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
-                Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-
         It "Should return objects with expected properties" {
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Props-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory $isolatedDir -Name "nul" | Out-Null
 
-            $results = Find-ReservedFiles -Path $Script:CurrentTestDir
+                $results = Find-ReservedFiles -Path $isolatedDir
 
-            $results[0].PSObject.Properties.Name | Should -Contain "Name"
-            $results[0].PSObject.Properties.Name | Should -Contain "Path"
-            $results[0].PSObject.Properties.Name | Should -Contain "Size"
-            $results[0].PSObject.Properties.Name | Should -Contain "Modified"
+                $results | Should -Not -BeNullOrEmpty
+                $results[0].PSObject.Properties.Name | Should -Contain "Name"
+                $results[0].PSObject.Properties.Name | Should -Contain "Path"
+                $results[0].PSObject.Properties.Name | Should -Contain "Size"
+                $results[0].PSObject.Properties.Name | Should -Contain "Modified"
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -358,9 +426,7 @@ Describe "Remove-ReservedFile" {
 
     AfterAll {
         if (Test-Path $Script:RemoveTestDir) {
-            Get-ChildItem -Path $Script:RemoveTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Remove-ReservedTestFile -FilePath $_.FullName
-            }
+            Clear-ReservedTestFiles -Directory $Script:RemoveTestDir
             Remove-Item -Path $Script:RemoveTestDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -373,9 +439,7 @@ Describe "Remove-ReservedFile" {
 
         AfterEach {
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -384,34 +448,38 @@ Describe "Remove-ReservedFile" {
             $nulPath = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul"
             Test-ReservedFileExists -FilePath $nulPath | Should -BeTrue
 
-            Remove-ReservedFile -Path $nulPath -Force
+            $result = Remove-ReservedFile -Path $nulPath -Force
 
             Test-ReservedFileExists -FilePath $nulPath | Should -BeFalse
+            $result.Success | Should -BeTrue
         }
 
         It "Should delete a CON file" {
             $conPath = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "con"
             Test-ReservedFileExists -FilePath $conPath | Should -BeTrue
 
-            Remove-ReservedFile -Path $conPath -Force
+            $result = Remove-ReservedFile -Path $conPath -Force
 
             Test-ReservedFileExists -FilePath $conPath | Should -BeFalse
+            $result.Success | Should -BeTrue
         }
 
-        It "Should return success result" {
+        It "Should return success result object" {
             $nulPath = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul"
 
             $result = Remove-ReservedFile -Path $nulPath -Force
 
             $result.Success | Should -BeTrue
+            $result.Path | Should -Be $nulPath
         }
 
-        It "Should handle non-existent file gracefully" {
+        It "Should return failure result for non-existent file" {
             $fakePath = Join-Path $Script:CurrentTestDir "nonexistent-nul"
 
             $result = Remove-ReservedFile -Path $fakePath -Force -ErrorAction SilentlyContinue
 
             $result.Success | Should -BeFalse
+            $result.Error | Should -Not -BeNullOrEmpty
         }
     }
 
@@ -425,9 +493,7 @@ Describe "Remove-ReservedFile" {
 
         AfterEach {
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
             if (Test-Path $Script:BackupDir) {
@@ -458,57 +524,65 @@ Describe "Remove-ReservedFiles (Batch)" {
 
     AfterAll {
         if (Test-Path $Script:BatchTestDir) {
-            Get-ChildItem -Path $Script:BatchTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Remove-ReservedTestFile -FilePath $_.FullName
-            }
+            Clear-ReservedTestFiles -Directory $Script:BatchTestDir
             Remove-Item -Path $Script:BatchTestDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
     Context "Batch Deletion" {
-        BeforeEach {
-            $Script:CurrentTestDir = Join-Path $Script:BatchTestDir "batch-$(Get-Random)"
-            New-Item -Path $Script:CurrentTestDir -ItemType Directory -Force | Out-Null
-        }
+        It "Should delete multiple reserved files" {
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Batch1-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            try {
+                $nul = New-ReservedTestFile -Directory $isolatedDir -Name "nul"
+                $con = New-ReservedTestFile -Directory $isolatedDir -Name "con"
+                $aux = New-ReservedTestFile -Directory $isolatedDir -Name "aux"
 
-        AfterEach {
-            if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
-                Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
+                $result = Remove-ReservedFiles -Path $isolatedDir -Force
+
+                Test-ReservedFileExists -FilePath $nul | Should -BeFalse
+                Test-ReservedFileExists -FilePath $con | Should -BeFalse
+                Test-ReservedFileExists -FilePath $aux | Should -BeFalse
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
 
-        It "Should delete multiple reserved files" {
-            $nul = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul"
-            $con = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "con"
-            $aux = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "aux"
-
-            Remove-ReservedFiles -Path $Script:CurrentTestDir -Force
-
-            Test-ReservedFileExists -FilePath $nul | Should -BeFalse
-            Test-ReservedFileExists -FilePath $con | Should -BeFalse
-            Test-ReservedFileExists -FilePath $aux | Should -BeFalse
-        }
-
         It "Should return count of deleted files" {
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "con" | Out-Null
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Batch2-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory $isolatedDir -Name "nul" | Out-Null
+                New-ReservedTestFile -Directory $isolatedDir -Name "con" | Out-Null
 
-            $result = Remove-ReservedFiles -Path $Script:CurrentTestDir -Force
+                $result = Remove-ReservedFiles -Path $isolatedDir -Force
 
-            $result.Deleted | Should -Be 2
+                $result.Deleted | Should -Be 2
+                $result.Found | Should -Be 2
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
 
         It "Should handle empty directory gracefully" {
-            $emptyDir = Join-Path $Script:CurrentTestDir "empty"
-            New-Item -Path $emptyDir -ItemType Directory -Force | Out-Null
+            # Create a fresh isolated directory
+            $isolatedDir = Join-Path $env:TEMP "RFC-Batch3-$(Get-Random)"
+            New-Item -Path $isolatedDir -ItemType Directory -Force | Out-Null
+            try {
+                $result = Remove-ReservedFiles -Path $isolatedDir -Force
 
-            $result = Remove-ReservedFiles -Path $emptyDir -Force
-
-            $result.Found | Should -Be 0
-            $result.Deleted | Should -Be 0
+                $result.Found | Should -Be 0
+                $result.Deleted | Should -Be 0
+            }
+            finally {
+                Remove-Item -Path $isolatedDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
@@ -520,9 +594,7 @@ Describe "Remove-ReservedFiles (Batch)" {
 
         AfterEach {
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -545,9 +617,7 @@ Describe "New-ReservedFileReport" {
 
     AfterAll {
         if (Test-Path $Script:ReportTestDir) {
-            Get-ChildItem -Path $Script:ReportTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Remove-ReservedTestFile -FilePath $_.FullName
-            }
+            Clear-ReservedTestFiles -Directory $Script:ReportTestDir
             Remove-Item -Path $Script:ReportTestDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -560,18 +630,23 @@ Describe "New-ReservedFileReport" {
 
         AfterEach {
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    # Skip HTML files - they're regular files
-                    if ($_.Extension -eq ".html") { return }
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
 
-        It "Should generate HTML report file" {
+        It "Should generate HTML report file using -Path" {
             New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
             $reportPath = Join-Path $Script:CurrentTestDir "report.html"
+
+            New-ReservedFileReport -Path $Script:CurrentTestDir -OutputPath $reportPath
+
+            Test-Path $reportPath | Should -BeTrue
+        }
+
+        It "Should generate HTML report file using -Files" {
+            New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
+            $reportPath = Join-Path $Script:CurrentTestDir "report2.html"
 
             $files = Find-ReservedFiles -Path $Script:CurrentTestDir
             New-ReservedFileReport -Files $files -OutputPath $reportPath
@@ -583,8 +658,7 @@ Describe "New-ReservedFileReport" {
             New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
             $reportPath = Join-Path $Script:CurrentTestDir "report.html"
 
-            $files = Find-ReservedFiles -Path $Script:CurrentTestDir
-            New-ReservedFileReport -Files $files -OutputPath $reportPath
+            New-ReservedFileReport -Path $Script:CurrentTestDir -OutputPath $reportPath
 
             $content = Get-Content -Path $reportPath -Raw
             $content | Should -Match "<!DOCTYPE html>"
@@ -595,8 +669,7 @@ Describe "New-ReservedFileReport" {
             New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul" | Out-Null
             $reportPath = Join-Path $Script:CurrentTestDir "report.html"
 
-            $files = Find-ReservedFiles -Path $Script:CurrentTestDir
-            New-ReservedFileReport -Files $files -OutputPath $reportPath
+            New-ReservedFileReport -Path $Script:CurrentTestDir -OutputPath $reportPath
 
             $content = Get-Content -Path $reportPath -Raw
             $content | Should -Match "nul"
@@ -660,22 +733,28 @@ Describe "Install-ReservedFilePreCommitHook" {
 
 Describe "Path Validation" {
     Context "Security Checks" {
-        It "Should reject paths with command injection attempts" {
+        It "Should reject paths with semicolon (command chaining)" {
             $maliciousPath = "C:\test; rm -rf /"
 
-            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw
+            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw -ExpectedMessage "*dangerous character*"
         }
 
         It "Should reject paths with pipe characters" {
             $maliciousPath = "C:\test | malicious"
 
-            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw
+            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw -ExpectedMessage "*dangerous character*"
         }
 
         It "Should reject paths with backticks" {
-            $maliciousPath = "C:\test`command"
+            $maliciousPath = "C:\test``command"
 
-            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw
+            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw -ExpectedMessage "*dangerous character*"
+        }
+
+        It "Should reject paths with ampersand" {
+            $maliciousPath = "C:\test & malicious"
+
+            { Find-ReservedFiles -Path $maliciousPath -ErrorAction Stop } | Should -Throw -ExpectedMessage "*dangerous character*"
         }
     }
 }
@@ -688,9 +767,7 @@ Describe "Edge Cases" {
 
     AfterAll {
         if (Test-Path $Script:EdgeTestDir) {
-            Get-ChildItem -Path $Script:EdgeTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Remove-ReservedTestFile -FilePath $_.FullName
-            }
+            Clear-ReservedTestFiles -Directory $Script:EdgeTestDir
             Remove-Item -Path $Script:EdgeTestDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -703,9 +780,7 @@ Describe "Edge Cases" {
 
         AfterEach {
             if (Test-Path $Script:CurrentTestDir) {
-                Get-ChildItem -Path $Script:CurrentTestDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-ReservedTestFile -FilePath $_.FullName
-                }
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
                 Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -734,16 +809,24 @@ Describe "Edge Cases" {
         }
 
         It "Should handle multiple scan paths" {
-            $path1 = Join-Path $Script:CurrentTestDir "path1"
-            $path2 = Join-Path $Script:CurrentTestDir "path2"
-            New-Item -Path $path1, $path2 -ItemType Directory -Force | Out-Null
+            # Create fresh isolated directories
+            $isolatedDir1 = Join-Path $env:TEMP "RFC-Multi1-$(Get-Random)"
+            $isolatedDir2 = Join-Path $env:TEMP "RFC-Multi2-$(Get-Random)"
+            New-Item -Path $isolatedDir1, $isolatedDir2 -ItemType Directory -Force | Out-Null
+            try {
+                New-ReservedTestFile -Directory $isolatedDir1 -Name "nul" | Out-Null
+                New-ReservedTestFile -Directory $isolatedDir2 -Name "con" | Out-Null
 
-            New-ReservedTestFile -Directory $path1 -Name "nul" | Out-Null
-            New-ReservedTestFile -Directory $path2 -Name "con" | Out-Null
+                $results = Find-ReservedFiles -Path $isolatedDir1, $isolatedDir2
 
-            $results = Find-ReservedFiles -Path $path1, $path2
-
-            $results.Count | Should -Be 2
+                $results.Count | Should -Be 2
+            }
+            finally {
+                Clear-ReservedTestFiles -Directory $isolatedDir1
+                Clear-ReservedTestFiles -Directory $isolatedDir2
+                Remove-Item -Path $isolatedDir1 -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path $isolatedDir2 -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
