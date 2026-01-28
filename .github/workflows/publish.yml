@@ -1,0 +1,66 @@
+name: Publish to PowerShell Gallery
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (leave empty to use module version)'
+        required: false
+        type: string
+
+env:
+  MODULE_NAME: ReservedFileCleaner
+
+jobs:
+  publish:
+    name: Publish Module
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Module
+        shell: pwsh
+        run: |
+          Write-Host "Validating module manifest..."
+          $manifest = Test-ModuleManifest -Path ./ReservedFileCleaner/ReservedFileCleaner.psd1 -ErrorAction Stop
+          Write-Host "Module Version: $($manifest.Version)"
+          Write-Host "Validation passed!" -ForegroundColor Green
+
+      - name: Run Tests
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = './Tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+
+          Invoke-Pester -Configuration $config
+
+      - name: Publish to PowerShell Gallery
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+        run: |
+          if (-not $env:PSGALLERY_API_KEY) {
+            Write-Host "PSGALLERY_API_KEY secret not configured - skipping publish" -ForegroundColor Yellow
+            Write-Host "To enable publishing, add your PowerShell Gallery API key as a repository secret named PSGALLERY_API_KEY"
+            exit 0
+          }
+
+          Write-Host "Publishing module to PowerShell Gallery..."
+
+          try {
+            Publish-Module -Path ./ReservedFileCleaner -NuGetApiKey $env:PSGALLERY_API_KEY -Verbose
+            Write-Host "Successfully published to PowerShell Gallery!" -ForegroundColor Green
+          }
+          catch {
+            Write-Host "Failed to publish: $_" -ForegroundColor Red
+            exit 1
+          }

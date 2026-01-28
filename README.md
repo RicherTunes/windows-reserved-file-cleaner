@@ -378,6 +378,75 @@ A: Windows intercepts these filenames at the API level for legacy compatibility.
 
 ---
 
+## PowerShell Gallery Module
+
+Install from PowerShell Gallery for easy access to module functions:
+
+```powershell
+# Install the module
+Install-Module -Name ReservedFileCleaner
+
+# Import and use
+Import-Module ReservedFileCleaner
+
+# Find reserved files
+Find-ReservedFiles -Path "D:\Projects"
+
+# Remove with confirmation
+Remove-ReservedFiles -Path "D:\Projects"
+
+# Install file watcher for real-time protection
+Install-ReservedFileWatcher -Path "D:\Projects"
+
+# Install Git pre-commit hook
+Install-ReservedFilePreCommitHook -Path "D:\MyRepo"
+```
+
+### Module Functions
+
+| Function | Description |
+|----------|-------------|
+| `Find-ReservedFiles` | Scan directories for reserved-name files |
+| `Remove-ReservedFile` | Delete a single reserved file |
+| `Remove-ReservedFiles` | Batch delete with options (alias: `rfc`) |
+| `Install-ReservedFileWatcher` | Start real-time file monitoring |
+| `Uninstall-ReservedFileWatcher` | Stop file monitoring |
+| `Install-ReservedFilePreCommitHook` | Add Git pre-commit hook |
+| `New-ReservedFileReport` | Generate HTML scan report |
+
+---
+
+## Development
+
+### Running Tests
+
+This project uses [Pester](https://pester.dev/) for testing:
+
+```powershell
+# Install Pester
+Install-Module -Name Pester -MinimumVersion 5.0 -Force
+
+# Run all tests
+Invoke-Pester -Path .\Tests\ -Output Detailed
+
+# Run with code coverage
+$config = New-PesterConfiguration
+$config.Run.Path = './Tests'
+$config.CodeCoverage.Enabled = $true
+$config.CodeCoverage.Path = @('./ReservedFileCleaner/ReservedFileCleaner.psm1')
+Invoke-Pester -Configuration $config
+```
+
+### CI/CD
+
+GitHub Actions automatically runs on push/PR:
+- **Pester Tests** - Full test suite with coverage reporting
+- **PSScriptAnalyzer** - PowerShell linting for best practices
+- **Module Validation** - Manifest and import verification
+- **Syntax Check** - PowerShell parsing validation
+
+---
+
 ## Contributing
 
 Issues and pull requests are welcome! If you find a bug or have a feature request, please [open an issue](https://github.com/RicherTunes/windows-reserved-file-cleaner/issues).

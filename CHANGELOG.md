@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-01-28
+
+### Added
+- **PowerShell Gallery module** (`ReservedFileCleaner`): Install via `Install-Module ReservedFileCleaner`
+- **Git pre-commit hook** (`Install-ReservedFilePreCommitHook`): Block commits containing reserved files
+- **File watcher mode** (`Install-ReservedFileWatcher`): Real-time monitoring with FileSystemWatcher
+- **Pester test suite**: Comprehensive tests in `Tests/ReservedFileCleaner.Tests.ps1`
+- **GitHub Actions CI**: Automated testing, linting, and module validation
+- **Module functions**: `Find-ReservedFiles`, `Remove-ReservedFile`, `Remove-ReservedFiles`, `New-ReservedFileReport`
+- **Short alias**: `rfc` for `Remove-ReservedFiles`
+
+### Changed
+- Refactored core functionality into reusable module functions
+- Improved code organization and testability
+
 ## [1.1.0] - 2026-01-28
 
 ### Added
@@ -52,5 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PowerShell 5.1+ compatible
 - Works on Windows 10/11 and Windows Server 2016+
 
+[1.2.0]: https://github.com/RicherTunes/windows-reserved-file-cleaner/releases/tag/v1.2.0
 [1.1.0]: https://github.com/RicherTunes/windows-reserved-file-cleaner/releases/tag/v1.1.0
 [1.0.0]: https://github.com/RicherTunes/windows-reserved-file-cleaner/releases/tag/v1.0.0

@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Pester Tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
+
+      - name: Run Pester Tests
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = './Tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'TestResults.xml'
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.CodeCoverage.Enabled = $true
+          $config.CodeCoverage.Path = @('./ReservedFileCleaner/ReservedFileCleaner.psm1', './Remove-ReservedFiles.ps1')
+          $config.CodeCoverage.OutputPath = 'coverage.xml'
+          $config.CodeCoverage.OutputFormat = 'JaCoCo'
+
+          Invoke-Pester -Configuration $config
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: TestResults.xml
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  lint:
+    name: PowerShell Script Analyzer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = @()
+
+          # Analyze main script
+          Write-Host "Analyzing Remove-ReservedFiles.ps1..."
+          $results += Invoke-ScriptAnalyzer -Path ./Remove-ReservedFiles.ps1 -Severity Warning,Error -ReportSummary
+
+          # Analyze module
+          Write-Host "Analyzing ReservedFileCleaner module..."
+          $results += Invoke-ScriptAnalyzer -Path ./ReservedFileCleaner/ -Recurse -Severity Warning,Error -ReportSummary
+
+          if ($results) {
+            Write-Host "`nIssues found:" -ForegroundColor Yellow
+            $results | Format-Table -AutoSize
+
+            # Fail only on errors, not warnings
+            $errors = $results | Where-Object { $_.Severity -eq 'Error' }
+            if ($errors) {
+              Write-Host "`nErrors found - failing build" -ForegroundColor Red
+              exit 1
+            }
+          } else {
+            Write-Host "No issues found!" -ForegroundColor Green
+          }
+
+  validate-module:
+    name: Validate Module Manifest
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test Module Manifest
+        shell: pwsh
+        run: |
+          Write-Host "Testing module manifest..."
+          $manifest = Test-ModuleManifest -Path ./ReservedFileCleaner/ReservedFileCleaner.psd1 -ErrorAction Stop
+
+          Write-Host "Module Name: $($manifest.Name)"
+          Write-Host "Module Version: $($manifest.Version)"
+          Write-Host "PowerShell Version: $($manifest.PowerShellVersion)"
+          Write-Host "Exported Functions: $($manifest.ExportedFunctions.Keys -join ', ')"
+          Write-Host "Exported Aliases: $($manifest.ExportedAliases.Keys -join ', ')"
+
+          Write-Host "`nModule manifest is valid!" -ForegroundColor Green
+
+      - name: Import Module Test
+        shell: pwsh
+        run: |
+          Write-Host "Testing module import..."
+          Import-Module ./ReservedFileCleaner/ReservedFileCleaner.psd1 -Force -ErrorAction Stop
+
+          # Verify exported functions
+          $expectedFunctions = @(
+            'Find-ReservedFiles',
+            'Remove-ReservedFile',
+            'Remove-ReservedFiles',
+            'Install-ReservedFileWatcher',
+            'Uninstall-ReservedFileWatcher',
+            'Install-ReservedFilePreCommitHook',
+            'New-ReservedFileReport'
+          )
+
+          foreach ($func in $expectedFunctions) {
+            if (-not (Get-Command -Name $func -Module ReservedFileCleaner -ErrorAction SilentlyContinue)) {
+              Write-Host "Missing function: $func" -ForegroundColor Red
+              exit 1
+            }
+            Write-Host "Found: $func" -ForegroundColor Green
+          }
+
+          # Verify alias
+          if (-not (Get-Alias -Name rfc -ErrorAction SilentlyContinue)) {
+            Write-Host "Missing alias: rfc" -ForegroundColor Red
+            exit 1
+          }
+          Write-Host "Found alias: rfc" -ForegroundColor Green
+
+          Write-Host "`nModule import successful!" -ForegroundColor Green
+
+  syntax-check:
+    name: PowerShell Syntax Check
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check PowerShell Syntax
+        shell: pwsh
+        run: |
+          $hasErrors = $false
+
+          Get-ChildItem -Path . -Include *.ps1,*.psm1,*.psd1 -Recurse | ForEach-Object {
+            Write-Host "Checking: $($_.Name)"
+
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+
+            if ($errors) {
+              Write-Host "  Syntax errors found:" -ForegroundColor Red
+              $errors | ForEach-Object {
+                Write-Host "    Line $($_.Extent.StartLineNumber): $($_.Message)" -ForegroundColor Red
+              }
+              $hasErrors = $true
+            } else {
+              Write-Host "  OK" -ForegroundColor Green
+            }
+          }
+
+          if ($hasErrors) {
+            exit 1
+          }
