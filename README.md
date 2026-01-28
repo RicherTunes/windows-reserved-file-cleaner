@@ -120,6 +120,29 @@ cd windows-reserved-file-cleaner
 .\Remove-ReservedFiles.ps1 -Exclude "node_modules", ".git", "vendor", "dist"
 ```
 
+### Safe Deletion (Recoverable)
+
+```powershell
+# Move to Recycle Bin instead of permanent delete
+.\Remove-ReservedFiles.ps1 -UseRecycleBin
+
+# Backup files before deletion
+.\Remove-ReservedFiles.ps1 -BackupPath "C:\Backup\reserved-files"
+
+# Both: backup AND use Recycle Bin
+.\Remove-ReservedFiles.ps1 -UseRecycleBin -BackupPath "C:\Backup"
+```
+
+### Targeted Scanning
+
+```powershell
+# Scan only 3 levels deep (faster)
+.\Remove-ReservedFiles.ps1 -List -MaxDepth 3
+
+# Scan network drive
+.\Remove-ReservedFiles.ps1 -Path "\\server\share\projects" -List
+```
+
 ### Export and Logging
 
 ```powershell
@@ -131,11 +154,32 @@ cd windows-reserved-file-cleaner
 
 # Save detailed log file
 .\Remove-ReservedFiles.ps1 -Force -LogFile "cleanup.log"
+
+# Generate HTML report
+.\Remove-ReservedFiles.ps1 -List -Report "scan-report.html"
+```
+
+### Automation & Scheduled Tasks
+
+```powershell
+# Save your preferred settings
+.\Remove-ReservedFiles.ps1 -Exclude "node_modules",".git" -UseRecycleBin -SaveConfig
+
+# Install weekly scheduled scan (runs Sundays at 3 AM)
+.\Remove-ReservedFiles.ps1 -InstallTask
+
+# Remove scheduled task
+.\Remove-ReservedFiles.ps1 -UninstallTask
+
+# Check for updates
+.\Remove-ReservedFiles.ps1 -CheckUpdate
 ```
 
 ---
 
 ## Parameters Reference
+
+### Core Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -145,13 +189,43 @@ cd windows-reserved-file-cleaner
 | `-Force` | switch | Delete all without confirmation. |
 | `-WhatIf` | switch | Dry run - show what would be deleted. |
 | `-Exclude` | string[] | Patterns to exclude (e.g., "node_modules"). |
-| `-LogFile` | string | Path to save detailed log file. |
+
+### Safety & Recovery
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-UseRecycleBin` | switch | Move to Recycle Bin instead of permanent delete. |
+| `-BackupPath` | string | Copy files here before deletion. |
+| `-WarnSize` | int | Warn for files larger than this (KB, default: 100). |
+| `-MaxDepth` | int | Max directory depth (1-100, default: unlimited). |
+
+### Output & Logging
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
 | `-OutputFormat` | string | Output format: Table (default), CSV, or JSON. |
+| `-LogFile` | string | Path to save detailed log file. |
+| `-Report` | string | Generate HTML report at this path. |
 | `-Quiet` | switch | Suppress banner and decorations (for scripting). |
+| `-Verbose` | switch | Show detailed scanning progress. |
+
+### Retry & Reliability
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
 | `-Retry` | int | Retry attempts for locked files (0-10, default: 0). |
 | `-RetryDelay` | int | Seconds between retries (1-60, default: 2). |
+
+### Configuration & Automation
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-Config` | string | Path to config file (default: ~/.reserved-cleaner.json). |
+| `-SaveConfig` | switch | Save current parameters as defaults. |
+| `-InstallTask` | switch | Install weekly scheduled task (requires admin). |
+| `-UninstallTask` | switch | Remove scheduled task (requires admin). |
+| `-CheckUpdate` | switch | Check for new versions online. |
 | `-Version` | switch | Display version information and exit. |
-| `-Verbose` | switch | Show detailed scanning progress. |
 
 ---
 

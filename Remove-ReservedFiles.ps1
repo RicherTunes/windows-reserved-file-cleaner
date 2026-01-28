@@ -41,6 +41,36 @@
 .PARAMETER RetryDelay
     Delay in seconds between retry attempts (default: 2).
 
+.PARAMETER UseRecycleBin
+    Move files to Recycle Bin instead of permanent deletion.
+
+.PARAMETER BackupPath
+    Copy files to this directory before deletion.
+
+.PARAMETER MaxDepth
+    Maximum directory recursion depth (default: unlimited).
+
+.PARAMETER WarnSize
+    Warn before deleting files larger than this size in KB (default: 100).
+
+.PARAMETER Report
+    Generate an HTML report at the specified path.
+
+.PARAMETER Config
+    Path to configuration file (default: ~/.reserved-cleaner.json).
+
+.PARAMETER SaveConfig
+    Save current parameters as default configuration.
+
+.PARAMETER InstallTask
+    Install a Windows scheduled task for weekly scans.
+
+.PARAMETER UninstallTask
+    Remove the Windows scheduled task.
+
+.PARAMETER CheckUpdate
+    Check for new versions online.
+
 .PARAMETER Version
     Display version information and exit.
 
@@ -52,24 +82,28 @@
     Lists all reserved-name files on all fixed drives.
 
 .EXAMPLE
-    .\Remove-ReservedFiles.ps1 -Path "D:\Projects" -Interactive
-    Scans D:\Projects and prompts for each file.
+    .\Remove-ReservedFiles.ps1 -Path "D:\Projects" -UseRecycleBin
+    Delete files by moving them to Recycle Bin (recoverable).
 
 .EXAMPLE
-    .\Remove-ReservedFiles.ps1 -Force -Exclude "node_modules",".git"
-    Deletes all reserved-name files, excluding node_modules and .git folders.
+    .\Remove-ReservedFiles.ps1 -Force -BackupPath "C:\Backup"
+    Backup files before deleting them.
 
 .EXAMPLE
-    .\Remove-ReservedFiles.ps1 -List -OutputFormat JSON -LogFile "scan.log"
-    Lists files in JSON format and writes log to scan.log.
+    .\Remove-ReservedFiles.ps1 -List -MaxDepth 3
+    Scan only 3 levels deep.
 
 .EXAMPLE
-    .\Remove-ReservedFiles.ps1 -Force -Retry 3 -RetryDelay 5
-    Delete all files, retrying locked files up to 3 times with 5 second delays.
+    .\Remove-ReservedFiles.ps1 -Report "scan-report.html"
+    Generate an HTML report of the scan.
 
 .EXAMPLE
-    .\Remove-ReservedFiles.ps1 -List -Quiet -OutputFormat JSON
-    Quiet mode for scripting - outputs only JSON data.
+    .\Remove-ReservedFiles.ps1 -SaveConfig
+    Save current settings as defaults.
+
+.EXAMPLE
+    .\Remove-ReservedFiles.ps1 -InstallTask
+    Set up automatic weekly scanning.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -87,12 +121,28 @@ param(
     [int]$Retry = 0,
     [ValidateRange(1, 60)]
     [int]$RetryDelay = 2,
+    [switch]$UseRecycleBin,
+    [string]$BackupPath,
+    [ValidateRange(1, 100)]
+    [int]$MaxDepth = 0,
+    [ValidateRange(0, 1048576)]
+    [int]$WarnSize = 100,
+    [string]$Report,
+    [string]$Config,
+    [switch]$SaveConfig,
+    [switch]$InstallTask,
+    [switch]$UninstallTask,
+    [switch]$CheckUpdate,
     [switch]$Version
 )
 
-# Script version
-$Script:ScriptVersion = "1.0.0"
+#region Script Configuration
+
+$Script:ScriptVersion = "1.1.0"
 $Script:REPO_URL = "https://github.com/RicherTunes/windows-reserved-file-cleaner"
+$Script:RELEASES_API = "https://api.github.com/repos/RicherTunes/windows-reserved-file-cleaner/releases/latest"
+$Script:TASK_NAME = "ReservedFileCleaner-WeeklyScan"
+$Script:DEFAULT_CONFIG_PATH = Join-Path $env:USERPROFILE ".reserved-cleaner.json"
 
 # Exit codes
 $Script:EXIT_SUCCESS = 0
@@ -105,6 +155,21 @@ $ReservedNames = @('NUL', 'CON', 'PRN', 'AUX') +
 
 # Log buffer for file output
 $Script:LogBuffer = [System.Collections.ArrayList]::new()
+
+# Statistics tracking
+$Script:Stats = @{
+    StartTime = $null
+    EndTime = $null
+    FilesScanned = 0
+    FilesFound = 0
+    FilesDeleted = 0
+    FilesFailed = 0
+    FilesSkipped = 0
+    BytesFreed = 0
+    Errors = [System.Collections.ArrayList]::new()
+}
+
+#endregion
 
 #region ASCII Art and Display Functions
 
@@ -144,17 +209,17 @@ function Write-Step {
         [string]$Icon,
         [string]$Message,
         [ConsoleColor]$Color = [ConsoleColor]::White,
-        [switch]$Force  # Show even in quiet mode
+        [switch]$ForceShow
     )
-    if ($Script:Quiet -and -not $Force) { return }
+    if ($Script:Quiet -and -not $ForceShow) { return }
     Write-Host "  $Icon " -ForegroundColor $Color -NoNewline
     Write-Host $Message
 }
 
-function Write-Success { param([string]$Message, [switch]$Force) Write-Step "[OK]" $Message ([ConsoleColor]::Green) -Force:$Force }
-function Write-Info    { param([string]$Message, [switch]$Force) Write-Step "[i]" $Message ([ConsoleColor]::Cyan) -Force:$Force }
-function Write-Warn    { param([string]$Message, [switch]$Force) Write-Step "[!]" $Message ([ConsoleColor]::Yellow) -Force:$Force }
-function Write-Err     { param([string]$Message) Write-Step "[X]" $Message ([ConsoleColor]::Red) }
+function Write-Success { param([string]$Message, [switch]$ForceShow) Write-Step "[OK]" $Message ([ConsoleColor]::Green) -ForceShow:$ForceShow }
+function Write-Info    { param([string]$Message, [switch]$ForceShow) Write-Step "[i]" $Message ([ConsoleColor]::Cyan) -ForceShow:$ForceShow }
+function Write-Warn    { param([string]$Message, [switch]$ForceShow) Write-Step "[!]" $Message ([ConsoleColor]::Yellow) -ForceShow:$ForceShow }
+function Write-Err     { param([string]$Message, [switch]$ForceShow) Write-Step "[X]" $Message ([ConsoleColor]::Red) -ForceShow:$ForceShow }
 
 function Write-Log {
     param(
@@ -168,6 +233,48 @@ function Write-Log {
 
     if ($VerbosePreference -eq 'Continue') {
         Write-Verbose $Message
+    }
+}
+
+#endregion
+
+#region Configuration Functions
+
+function Get-ConfigPath {
+    if ($Config) { return $Config }
+    return $Script:DEFAULT_CONFIG_PATH
+}
+
+function Import-Configuration {
+    $configPath = Get-ConfigPath
+    if (-not (Test-Path -LiteralPath $configPath)) { return @{} }
+
+    try {
+        $content = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        $config = @{}
+        $content.PSObject.Properties | ForEach-Object { $config[$_.Name] = $_.Value }
+        Write-Log "Loaded configuration from: $configPath"
+        return $config
+    }
+    catch {
+        Write-Log "Failed to load config: $_" 'WARN'
+        return @{}
+    }
+}
+
+function Export-Configuration {
+    param([hashtable]$Settings)
+
+    $configPath = Get-ConfigPath
+
+    try {
+        $Settings | ConvertTo-Json -Depth 2 | Out-File -FilePath $configPath -Encoding UTF8
+        Write-Success "Configuration saved to: $configPath"
+        return $true
+    }
+    catch {
+        Write-Err "Failed to save configuration: $_"
+        return $false
     }
 }
 
@@ -207,6 +314,11 @@ function Test-IsSystemDrive {
     return $DrivePath.StartsWith($systemDrive, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-IsUNCPath {
+    param([string]$TestPath)
+    return $TestPath.StartsWith("\\") -and -not $TestPath.StartsWith("\\?\")
+}
+
 function Test-ShouldExclude {
     param(
         [string]$FilePath,
@@ -223,6 +335,22 @@ function Test-ShouldExclude {
     return $false
 }
 
+function Request-Elevation {
+    if (Test-IsAdmin) { return $true }
+
+    Write-Warn "This operation requires administrator privileges."
+    $response = Read-Host "  Restart as Administrator? [Y]es/[N]o"
+
+    if ($response -match '^[Yy]') {
+        $scriptPath = $PSCommandPath
+        $arguments = $MyInvocation.Line -replace [regex]::Escape($MyInvocation.InvocationName), ""
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" $arguments"
+        exit $EXIT_SUCCESS
+    }
+
+    return $false
+}
+
 #endregion
 
 #region Core Functions
@@ -230,17 +358,19 @@ function Test-ShouldExclude {
 function Find-ReservedFiles {
     param(
         [string[]]$ScanPaths,
-        [string[]]$ExcludePatterns
+        [string[]]$ExcludePatterns,
+        [int]$MaxRecursionDepth = 0
     )
 
     $results = [System.Collections.ArrayList]::new()
     $totalPaths = $ScanPaths.Count
     $currentPathIndex = 0
-    $filesScanned = 0
 
     Write-Host ""
     Write-Info "Starting scan..."
     Write-Host ""
+
+    $Script:Stats.StartTime = Get-Date
 
     foreach ($scanPath in $ScanPaths) {
         $currentPathIndex++
@@ -249,36 +379,54 @@ function Find-ReservedFiles {
         Write-Progress -Activity "Scanning for reserved-name files" `
                        -Status "[$percentComplete%] Scanning: $scanPath" `
                        -PercentComplete $percentComplete `
-                       -CurrentOperation "Files checked: $filesScanned"
+                       -CurrentOperation "Files checked: $($Script:Stats.FilesScanned)"
 
         Write-Log "Scanning: $scanPath"
 
+        # Handle UNC paths
+        $isUNC = Test-IsUNCPath -TestPath $scanPath
+        if ($isUNC) {
+            Write-Log "UNC path detected: $scanPath" 'INFO'
+        }
+
         try {
-            Get-ChildItem -LiteralPath $scanPath -Recurse -File -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    $filesScanned++
+            $gciParams = @{
+                LiteralPath = $scanPath
+                Recurse = $true
+                File = $true
+                ErrorAction = 'SilentlyContinue'
+            }
 
-                    if ($_.Name -in $ReservedNames) {
-                        # Check exclusions
-                        if (Test-ShouldExclude -FilePath $_.FullName -ExcludePatterns $ExcludePatterns) {
-                            Write-Log "Excluded: $($_.FullName)" 'DEBUG'
-                            return
-                        }
+            # Add depth limit if specified
+            if ($MaxRecursionDepth -gt 0) {
+                $gciParams['Depth'] = $MaxRecursionDepth
+            }
 
-                        $fileInfo = [PSCustomObject]@{
-                            Name       = $_.Name
-                            Path       = $_.FullName
-                            Directory  = $_.DirectoryName
-                            Size       = $_.Length
-                            Modified   = $_.LastWriteTime
-                            ReadOnly   = $_.IsReadOnly
-                            Attributes = $_.Attributes.ToString()
-                        }
+            Get-ChildItem @gciParams | ForEach-Object {
+                $Script:Stats.FilesScanned++
 
-                        $null = $results.Add($fileInfo)
-                        Write-Log "Found: $($_.FullName)"
+                if ($_.Name -in $ReservedNames) {
+                    # Check exclusions
+                    if (Test-ShouldExclude -FilePath $_.FullName -ExcludePatterns $ExcludePatterns) {
+                        Write-Log "Excluded: $($_.FullName)" 'DEBUG'
+                        return
                     }
+
+                    $fileInfo = [PSCustomObject]@{
+                        Name       = $_.Name
+                        Path       = $_.FullName
+                        Directory  = $_.DirectoryName
+                        Size       = $_.Length
+                        Modified   = $_.LastWriteTime
+                        ReadOnly   = $_.IsReadOnly
+                        Attributes = $_.Attributes.ToString()
+                    }
+
+                    $null = $results.Add($fileInfo)
+                    $Script:Stats.FilesFound++
+                    Write-Log "Found: $($_.FullName)"
                 }
+            }
         }
         catch {
             Write-Log "Error scanning ${scanPath}: $_" 'ERROR'
@@ -288,10 +436,70 @@ function Find-ReservedFiles {
 
     Write-Progress -Activity "Scanning for reserved-name files" -Completed
 
-    Write-Log "Scan complete. Found $($results.Count) reserved-name file(s). Scanned $filesScanned files total."
-    Write-Info "Scanned $filesScanned files across $totalPaths location(s)"
+    $Script:Stats.EndTime = Get-Date
+    $duration = $Script:Stats.EndTime - $Script:Stats.StartTime
+
+    Write-Log "Scan complete. Found $($results.Count) reserved-name file(s). Scanned $($Script:Stats.FilesScanned) files in $($duration.TotalSeconds.ToString('F1'))s"
+    Write-Info "Scanned $($Script:Stats.FilesScanned) files across $totalPaths location(s) in $($duration.TotalSeconds.ToString('F1'))s"
 
     return $results
+}
+
+function Backup-ReservedFile {
+    param(
+        [string]$FilePath,
+        [string]$BackupDirectory
+    )
+
+    if (-not $BackupDirectory) { return @{ Success = $true } }
+
+    try {
+        # Create backup directory if needed
+        if (-not (Test-Path -LiteralPath $BackupDirectory)) {
+            New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
+        }
+
+        # Create unique backup filename
+        $fileName = Split-Path $FilePath -Leaf
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $backupName = "${fileName}_${timestamp}_$(Get-Random -Maximum 9999)"
+        $backupPath = Join-Path $BackupDirectory $backupName
+
+        # Use extended path for copy
+        $ntPath = "\\?\$FilePath"
+        Copy-Item -LiteralPath $ntPath -Destination $backupPath -Force -ErrorAction Stop
+
+        Write-Log "Backed up: $FilePath -> $backupPath"
+        return @{ Success = $true; BackupPath = $backupPath }
+    }
+    catch {
+        Write-Log "Backup failed for ${FilePath}: $_" 'ERROR'
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Move-ToRecycleBin {
+    param([string]$FilePath)
+
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $ntPath = "\\?\$FilePath"
+
+        # FileSystem.DeleteFile with RecycleOption
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+            $FilePath,
+            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+        )
+
+        Write-Log "Moved to Recycle Bin: $FilePath"
+        return @{ Success = $true; Error = $null; Status = 'Recycled' }
+    }
+    catch {
+        # Fall back to cmd.exe deletion if recycle fails
+        Write-Log "Recycle Bin failed, trying direct delete: $FilePath" 'WARN'
+        return $null  # Signal to try regular deletion
+    }
 }
 
 function Remove-ReservedFile {
@@ -299,7 +507,9 @@ function Remove-ReservedFile {
         [string]$FilePath,
         [switch]$IsReadOnly,
         [int]$RetryCount = 0,
-        [int]$RetryDelaySeconds = 2
+        [int]$RetryDelaySeconds = 2,
+        [switch]$ToRecycleBin,
+        [string]$BackupDir
     )
 
     # Validate path before passing to cmd.exe
@@ -312,8 +522,29 @@ function Remove-ReservedFile {
         }
     }
 
+    # Backup if requested
+    if ($BackupDir) {
+        $backupResult = Backup-ReservedFile -FilePath $FilePath -BackupDirectory $BackupDir
+        if (-not $backupResult.Success) {
+            return @{
+                Success = $false
+                Error   = "Backup failed: $($backupResult.Error)"
+                Status  = 'BackupFailed'
+            }
+        }
+    }
+
+    # Try Recycle Bin if requested
+    if ($ToRecycleBin) {
+        $recycleResult = Move-ToRecycleBin -FilePath $FilePath
+        if ($recycleResult) {
+            return $recycleResult
+        }
+        # If null, fall through to regular deletion
+        Write-Log "Falling back to permanent deletion for: $FilePath" 'WARN'
+    }
+
     # Use extended path prefix to bypass reserved name checking
-    # PowerShell's Remove-Item doesn't support \\?\ prefix, so use cmd.exe
     $ntPath = "\\?\$FilePath"
 
     $attempt = 0
@@ -397,7 +628,6 @@ function Remove-ReservedFile {
         }
     }
 
-    # Should not reach here, but just in case
     return @{
         Success = $false
         Error   = "Unexpected error during deletion"
@@ -413,6 +643,24 @@ function Format-FileSize {
     elseif ($Bytes -lt 1GB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
     else { return "{0:N1} GB" -f ($Bytes / 1GB) }
 }
+
+function Format-Duration {
+    param([TimeSpan]$Duration)
+
+    if ($Duration.TotalSeconds -lt 60) {
+        return "$($Duration.TotalSeconds.ToString('F1'))s"
+    }
+    elseif ($Duration.TotalMinutes -lt 60) {
+        return "$($Duration.Minutes)m $($Duration.Seconds)s"
+    }
+    else {
+        return "$($Duration.Hours)h $($Duration.Minutes)m $($Duration.Seconds)s"
+    }
+}
+
+#endregion
+
+#region Display Functions
 
 function Show-Results {
     param(
@@ -496,11 +744,15 @@ function Show-Results {
             $jsonData | ConvertTo-Json -Depth 2 | ForEach-Object { Write-Host $_ }
         }
         default {
-            # Table format with nice formatting
             foreach ($f in $Files) {
                 $icon = if ($f.ReadOnly) { "[R]" } else { "   " }
                 $sizeStr = (Format-FileSize $f.Size).PadLeft(10)
                 $dateStr = $f.Modified.ToString("yyyy-MM-dd HH:mm")
+
+                # Warn for large files
+                if ($f.Size -gt ($WarnSize * 1KB)) {
+                    $icon = "[!]"
+                }
 
                 Write-Host "  $icon " -ForegroundColor Yellow -NoNewline
                 Write-Host $f.Name.PadRight(6) -ForegroundColor White -NoNewline
@@ -512,7 +764,7 @@ function Show-Results {
                 Write-Host $f.Path -ForegroundColor White
             }
             Write-Host ""
-            Write-Host "  Legend: [R] = Read-only file" -ForegroundColor Gray
+            Write-Host "  Legend: [R] = Read-only, [!] = Large file (>$WarnSize KB)" -ForegroundColor Gray
         }
     }
 }
@@ -522,8 +774,17 @@ function Show-Summary {
         [int]$Total,
         [int]$Deleted,
         [int]$Failed,
-        [int]$Skipped
+        [int]$Skipped,
+        [long]$BytesFreed
     )
+
+    if ($Script:Quiet) { return }
+
+    $duration = if ($Script:Stats.EndTime -and $Script:Stats.StartTime) {
+        $Script:Stats.EndTime - $Script:Stats.StartTime
+    } else {
+        [TimeSpan]::Zero
+    }
 
     Write-Host ""
     Write-Host "  ================================================================" -ForegroundColor Cyan
@@ -548,6 +809,19 @@ function Show-Summary {
     }
 
     Write-Host ""
+    Write-Host "  Space freed:          " -NoNewline
+    Write-Host "$(Format-FileSize $BytesFreed)" -ForegroundColor Cyan
+
+    Write-Host "  Duration:             " -NoNewline
+    Write-Host "$(Format-Duration $duration)" -ForegroundColor Gray
+
+    if ($Script:Stats.FilesScanned -gt 0 -and $duration.TotalSeconds -gt 0) {
+        $filesPerSec = [Math]::Round($Script:Stats.FilesScanned / $duration.TotalSeconds)
+        Write-Host "  Scan speed:           " -NoNewline
+        Write-Host "$filesPerSec files/sec" -ForegroundColor Gray
+    }
+
+    Write-Host ""
 
     if ($Deleted -eq $Total -and $Total -gt 0) {
         Write-Host "  [SUCCESS] " -ForegroundColor Green -NoNewline
@@ -564,6 +838,255 @@ function Show-Summary {
 
     Write-Host ""
 }
+
+#endregion
+
+#region Report Generation
+
+function New-HtmlReport {
+    param(
+        $Files,
+        [string]$OutputPath
+    )
+
+    $duration = if ($Script:Stats.EndTime -and $Script:Stats.StartTime) {
+        $Script:Stats.EndTime - $Script:Stats.StartTime
+    } else {
+        [TimeSpan]::Zero
+    }
+
+    $totalSize = ($Files | Measure-Object -Property Size -Sum).Sum
+    $scanDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reserved File Cleaner Report</title>
+    <style>
+        :root { --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --text: #e4e4e4; --success: #4ade80; --warning: #fbbf24; --error: #f87171; --info: #60a5fa; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { color: var(--info); margin-bottom: 0.5rem; }
+        .subtitle { color: #888; margin-bottom: 2rem; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+        .stat-card { background: var(--card); padding: 1.5rem; border-radius: 8px; border-left: 4px solid var(--accent); }
+        .stat-value { font-size: 2rem; font-weight: bold; color: var(--info); }
+        .stat-label { color: #888; font-size: 0.9rem; margin-top: 0.25rem; }
+        .stat-card.success .stat-value { color: var(--success); }
+        .stat-card.warning .stat-value { color: var(--warning); }
+        .stat-card.error .stat-value { color: var(--error); }
+        table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 8px; overflow: hidden; }
+        th, td { padding: 1rem; text-align: left; border-bottom: 1px solid var(--accent); }
+        th { background: var(--accent); font-weight: 600; }
+        tr:hover { background: rgba(255,255,255,0.05); }
+        .size { font-family: monospace; color: var(--info); }
+        .path { font-family: monospace; font-size: 0.85rem; word-break: break-all; }
+        .readonly { color: var(--warning); }
+        .footer { margin-top: 2rem; text-align: center; color: #666; font-size: 0.85rem; }
+        .footer a { color: var(--info); }
+        .empty-state { text-align: center; padding: 3rem; color: var(--success); }
+        .empty-state h2 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Windows Reserved File Cleaner</h1>
+        <p class="subtitle">Scan Report - $scanDate</p>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">$($Script:Stats.FilesScanned.ToString('N0'))</div>
+                <div class="stat-label">Files Scanned</div>
+            </div>
+            <div class="stat-card $(if ($Files.Count -gt 0) { 'warning' } else { 'success' })">
+                <div class="stat-value">$($Files.Count)</div>
+                <div class="stat-label">Reserved Files Found</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">$(Format-FileSize $totalSize)</div>
+                <div class="stat-label">Total Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">$(Format-Duration $duration)</div>
+                <div class="stat-label">Scan Duration</div>
+            </div>
+        </div>
+
+$(if ($Files.Count -eq 0) {
+@"
+        <div class="empty-state">
+            <h2>No Reserved Files Found</h2>
+            <p>Your system is clean!</p>
+        </div>
+"@
+} else {
+@"
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Size</th>
+                    <th>Modified</th>
+                    <th>Path</th>
+                </tr>
+            </thead>
+            <tbody>
+$($Files | ForEach-Object {
+    $roClass = if ($_.ReadOnly) { ' class="readonly"' } else { '' }
+    $roIndicator = if ($_.ReadOnly) { ' [R]' } else { '' }
+    "                <tr>
+                    <td$roClass>$($_.Name)$roIndicator</td>
+                    <td class=`"size`">$(Format-FileSize $_.Size)</td>
+                    <td>$($_.Modified.ToString('yyyy-MM-dd HH:mm'))</td>
+                    <td class=`"path`">$($_.Path)</td>
+                </tr>"
+})
+            </tbody>
+        </table>
+"@
+})
+
+        <div class="footer">
+            Generated by <a href="$Script:REPO_URL">Windows Reserved File Cleaner</a> v$Script:ScriptVersion
+        </div>
+    </div>
+</body>
+</html>
+"@
+
+    try {
+        $html | Out-File -FilePath $OutputPath -Encoding UTF8
+        Write-Success "HTML report saved to: $OutputPath"
+        return $true
+    }
+    catch {
+        Write-Err "Failed to save HTML report: $_"
+        return $false
+    }
+}
+
+#endregion
+
+#region Scheduled Task Functions
+
+function Install-ScheduledTask {
+    if (-not (Test-IsAdmin)) {
+        Write-Err "Installing a scheduled task requires administrator privileges."
+        if (-not (Request-Elevation)) {
+            return $false
+        }
+    }
+
+    $scriptPath = $PSCommandPath
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -List -LogFile `"$env:USERPROFILE\reserved-cleaner-scan.log`""
+
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+    try {
+        Register-ScheduledTask -TaskName $Script:TASK_NAME `
+            -Action $action `
+            -Trigger $trigger `
+            -Settings $settings `
+            -Description "Weekly scan for Windows reserved-name files created by AI tools" `
+            -RunLevel Highest `
+            -Force | Out-Null
+
+        Write-Success "Scheduled task installed: $Script:TASK_NAME"
+        Write-Info "The scan will run every Sunday at 3:00 AM"
+        Write-Info "Log file: $env:USERPROFILE\reserved-cleaner-scan.log"
+        return $true
+    }
+    catch {
+        Write-Err "Failed to install scheduled task: $_"
+        return $false
+    }
+}
+
+function Uninstall-ScheduledTask {
+    if (-not (Test-IsAdmin)) {
+        Write-Err "Removing a scheduled task requires administrator privileges."
+        return $false
+    }
+
+    try {
+        Unregister-ScheduledTask -TaskName $Script:TASK_NAME -Confirm:$false -ErrorAction Stop
+        Write-Success "Scheduled task removed: $Script:TASK_NAME"
+        return $true
+    }
+    catch {
+        if ($_.Exception.Message -match 'does not exist') {
+            Write-Warn "Scheduled task not found: $Script:TASK_NAME"
+        }
+        else {
+            Write-Err "Failed to remove scheduled task: $_"
+        }
+        return $false
+    }
+}
+
+#endregion
+
+#region Update Functions
+
+function Get-LatestVersion {
+    try {
+        $response = Invoke-RestMethod -Uri $Script:RELEASES_API -TimeoutSec 10 -ErrorAction Stop
+        $latestVersion = $response.tag_name -replace '^v', ''
+        $downloadUrl = $response.assets | Where-Object { $_.name -eq 'Remove-ReservedFiles.ps1' } | Select-Object -ExpandProperty browser_download_url
+
+        return @{
+            Version = $latestVersion
+            DownloadUrl = if ($downloadUrl) { $downloadUrl } else { $response.zipball_url }
+            ReleaseUrl = $response.html_url
+            ReleaseNotes = $response.body
+        }
+    }
+    catch {
+        Write-Log "Failed to check for updates: $_" 'ERROR'
+        return $null
+    }
+}
+
+function Test-NewVersionAvailable {
+    $latest = Get-LatestVersion
+    if (-not $latest) {
+        Write-Warn "Could not check for updates. Please check your internet connection."
+        return $false
+    }
+
+    $current = [Version]$Script:ScriptVersion
+    $latestVer = [Version]$latest.Version
+
+    if ($latestVer -gt $current) {
+        Write-Host ""
+        Write-Host "  ================================================================" -ForegroundColor Green
+        Write-Host "                    NEW VERSION AVAILABLE" -ForegroundColor White
+        Write-Host "  ================================================================" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Current version:  " -NoNewline
+        Write-Host "v$Script:ScriptVersion" -ForegroundColor Yellow
+        Write-Host "  Latest version:   " -NoNewline
+        Write-Host "v$($latest.Version)" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Release URL: $($latest.ReleaseUrl)" -ForegroundColor Cyan
+        Write-Host ""
+        return $true
+    }
+    else {
+        Write-Success "You are running the latest version (v$Script:ScriptVersion)"
+        return $false
+    }
+}
+
+#endregion
+
+#region Log Functions
 
 function Save-Log {
     param([string]$LogPath)
@@ -592,12 +1115,50 @@ if ($Version) {
     exit $EXIT_SUCCESS
 }
 
+# Handle update check
+if ($CheckUpdate) {
+    Show-Banner
+    Test-NewVersionAvailable | Out-Null
+    exit $EXIT_SUCCESS
+}
+
+# Handle scheduled task operations
+if ($InstallTask) {
+    Show-Banner
+    if (Install-ScheduledTask) { exit $EXIT_SUCCESS } else { exit $EXIT_ERROR }
+}
+
+if ($UninstallTask) {
+    Show-Banner
+    if (Uninstall-ScheduledTask) { exit $EXIT_SUCCESS } else { exit $EXIT_ERROR }
+}
+
+# Load configuration
+$loadedConfig = Import-Configuration
+if ($loadedConfig.Count -gt 0 -and -not $Quiet) {
+    Write-Log "Using saved configuration"
+}
+
+# Handle save config
+if ($SaveConfig) {
+    Show-Banner
+    $configToSave = @{
+        Exclude = $Exclude
+        WarnSize = $WarnSize
+        Retry = $Retry
+        RetryDelay = $RetryDelay
+        UseRecycleBin = $UseRecycleBin.IsPresent
+        MaxDepth = $MaxDepth
+    }
+    if (Export-Configuration -Settings $configToSave) { exit $EXIT_SUCCESS } else { exit $EXIT_ERROR }
+}
+
 # Show banner
 Show-Banner
 
 # Log start
 Write-Log "=== Windows Reserved File Cleaner v$Script:ScriptVersion started ==="
-$paramString = "Path=$Path, List=$List, Interactive=$Interactive, Force=$Force, Exclude=$Exclude, Retry=$Retry"
+$paramString = "Path=$Path, List=$List, Force=$Force, UseRecycleBin=$UseRecycleBin, MaxDepth=$MaxDepth"
 Write-Log "Parameters: $paramString"
 
 # Admin and system drive warning
@@ -640,6 +1201,18 @@ if (-not $Path) {
 # Validate paths
 $validPaths = @()
 foreach ($p in $Path) {
+    # Handle UNC paths specially
+    if (Test-IsUNCPath -TestPath $p) {
+        if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) {
+            $validPaths += $p
+            Write-Info "UNC path detected: $p"
+        }
+        else {
+            Write-Warn "UNC path not accessible: $p"
+        }
+        continue
+    }
+
     $validation = Test-ValidPath -PathToTest $p
     if ($validation.Valid) {
         $validPaths += $p
@@ -655,16 +1228,34 @@ if ($validPaths.Count -eq 0) {
     exit $EXIT_ERROR
 }
 
-# Show exclusions if any
-if ($Exclude) {
-    Write-Info "Excluding patterns: $($Exclude -join ', ')"
+# Show options
+if ($Exclude) { Write-Info "Excluding patterns: $($Exclude -join ', ')" }
+if ($MaxDepth -gt 0) { Write-Info "Max depth: $MaxDepth levels" }
+if ($UseRecycleBin) { Write-Info "Using Recycle Bin (files can be recovered)" }
+if ($BackupPath) { Write-Info "Backup directory: $BackupPath" }
+
+# Create backup directory if specified
+if ($BackupPath -and -not (Test-Path -LiteralPath $BackupPath)) {
+    try {
+        New-Item -ItemType Directory -Path $BackupPath -Force | Out-Null
+        Write-Info "Created backup directory: $BackupPath"
+    }
+    catch {
+        Write-Err "Failed to create backup directory: $_"
+        exit $EXIT_ERROR
+    }
 }
 
 # Find files
-$files = Find-ReservedFiles -ScanPaths $validPaths -ExcludePatterns $Exclude
+$files = Find-ReservedFiles -ScanPaths $validPaths -ExcludePatterns $Exclude -MaxRecursionDepth $MaxDepth
 
 # Display results
 Show-Results -Files $files -Format $OutputFormat
+
+# Generate HTML report if requested
+if ($Report) {
+    New-HtmlReport -Files $files -OutputPath $Report
+}
 
 if ($files.Count -eq 0) {
     Save-Log -LogPath $LogFile
@@ -694,6 +1285,7 @@ if ($WhatIfPreference) {
 $deleted = 0
 $failed = 0
 $skipped = 0
+$bytesFreed = 0
 $errors = [System.Collections.ArrayList]::new()
 
 Write-Host ""
@@ -702,16 +1294,28 @@ Write-Host "                        DELETION MODE" -ForegroundColor White
 Write-Host "  ================================================================" -ForegroundColor Magenta
 Write-Host ""
 
+if ($UseRecycleBin) {
+    Write-Info "Files will be moved to Recycle Bin (recoverable)"
+}
+
 if ($Force) {
-    # Delete all without confirmation
     Write-Info "Force mode - deleting all files..."
     Write-Host ""
 
     foreach ($file in $files) {
-        $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
+        # Warn for large files
+        if ($file.Size -gt ($WarnSize * 1KB)) {
+            Write-Warn "Large file: $($file.Path) ($(Format-FileSize $file.Size))"
+        }
+
+        $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly `
+            -RetryCount $Retry -RetryDelaySeconds $RetryDelay `
+            -ToRecycleBin:$UseRecycleBin -BackupDir $BackupPath
+
         if ($result.Success) {
             Write-Success "Deleted: $($file.Path)"
             $deleted++
+            $bytesFreed += $file.Size
         }
         else {
             Write-Err "Failed: $($file.Path)"
@@ -722,7 +1326,6 @@ if ($Force) {
     }
 }
 elseif ($Interactive) {
-    # Prompt for each file
     Write-Info "Interactive mode - you will be prompted for each file."
     Write-Host ""
 
@@ -736,21 +1339,27 @@ elseif ($Interactive) {
             $sizeStr = Format-FileSize $file.Size
             $roIndicator = ""
             if ($file.ReadOnly) { $roIndicator = " [READ-ONLY]" }
+            $largeIndicator = ""
+            if ($file.Size -gt ($WarnSize * 1KB)) { $largeIndicator = " [LARGE FILE]" }
 
             Write-Host ""
             Write-Host "  File: " -NoNewline
             Write-Host $file.Path -ForegroundColor Yellow
-            Write-Host "  Size: $sizeStr$roIndicator" -ForegroundColor Gray
+            Write-Host "  Size: $sizeStr$roIndicator$largeIndicator" -ForegroundColor Gray
             Write-Host ""
             $choice = Read-Host "  Delete this file? [Y]es / [N]o / [A]ll / [Q]uit"
         }
 
         switch -Regex ($choice) {
             '^[Yy]' {
-                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
+                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly `
+                    -RetryCount $Retry -RetryDelaySeconds $RetryDelay `
+                    -ToRecycleBin:$UseRecycleBin -BackupDir $BackupPath
+
                 if ($result.Success) {
                     Write-Success "Deleted: $($file.Path)"
                     $deleted++
+                    $bytesFreed += $file.Size
                 }
                 else {
                     Write-Err "Failed: $($file.Path)"
@@ -761,10 +1370,14 @@ elseif ($Interactive) {
             }
             '^[Aa]' {
                 $deleteAll = $true
-                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
+                $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly `
+                    -RetryCount $Retry -RetryDelaySeconds $RetryDelay `
+                    -ToRecycleBin:$UseRecycleBin -BackupDir $BackupPath
+
                 if ($result.Success) {
                     Write-Success "Deleted: $($file.Path)"
                     $deleted++
+                    $bytesFreed += $file.Size
                 }
                 else {
                     Write-Err "Failed: $($file.Path)"
@@ -796,10 +1409,14 @@ else {
     if ($response -match '^[Yy]') {
         Write-Host ""
         foreach ($file in $files) {
-            $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly -RetryCount $Retry -RetryDelaySeconds $RetryDelay
+            $result = Remove-ReservedFile -FilePath $file.Path -IsReadOnly:$file.ReadOnly `
+                -RetryCount $Retry -RetryDelaySeconds $RetryDelay `
+                -ToRecycleBin:$UseRecycleBin -BackupDir $BackupPath
+
             if ($result.Success) {
                 Write-Success "Deleted: $($file.Path)"
                 $deleted++
+                $bytesFreed += $file.Size
             }
             else {
                 Write-Err "Failed: $($file.Path)"
@@ -816,11 +1433,18 @@ else {
     }
 }
 
+# Update stats
+$Script:Stats.FilesDeleted = $deleted
+$Script:Stats.FilesFailed = $failed
+$Script:Stats.FilesSkipped = $skipped
+$Script:Stats.BytesFreed = $bytesFreed
+$Script:Stats.EndTime = Get-Date
+
 # Show summary
-Show-Summary -Total $files.Count -Deleted $deleted -Failed $failed -Skipped $skipped
+Show-Summary -Total $files.Count -Deleted $deleted -Failed $failed -Skipped $skipped -BytesFreed $bytesFreed
 
 # Log completion
-$completionMsg = "=== Operation completed: $deleted deleted, $failed failed, $skipped skipped ==="
+$completionMsg = "=== Operation completed: $deleted deleted, $failed failed, $skipped skipped, $(Format-FileSize $bytesFreed) freed ==="
 Write-Log $completionMsg
 
 # Save log file
