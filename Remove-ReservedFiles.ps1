@@ -103,10 +103,16 @@ function Remove-ReservedFile {
     )
 
     # Use extended path prefix to bypass reserved name checking
+    # PowerShell's Remove-Item doesn't support \\?\ prefix, so use cmd.exe
     $ntPath = "\\?\$FilePath"
 
     try {
-        Remove-Item -LiteralPath $ntPath -Force -ErrorAction Stop
+        $output = cmd /c "del /f /q `"$ntPath`"" 2>&1
+
+        # Verify the file was actually deleted
+        if (Test-Path -LiteralPath $FilePath) {
+            return @{ Success = $false; Error = "File still exists after deletion attempt" }
+        }
         return @{ Success = $true; Error = $null }
     }
     catch {
