@@ -138,7 +138,7 @@ param(
 
 #region Script Configuration
 
-$Script:ScriptVersion = "1.1.0"
+$Script:ScriptVersion = "1.2.1"
 $Script:REPO_URL = "https://github.com/RicherTunes/windows-reserved-file-cleaner"
 $Script:RELEASES_API = "https://api.github.com/repos/RicherTunes/windows-reserved-file-cleaner/releases/latest"
 $Script:TASK_NAME = "ReservedFileCleaner-WeeklyScan"
@@ -294,8 +294,12 @@ function Test-ValidPath {
         }
     }
 
-    # Check if path exists
-    if (-not (Test-Path -LiteralPath $PathToTest -ErrorAction SilentlyContinue)) {
+    # Check if path exists. Use the \\?\ extended prefix because $PathToTest may
+    # target a Windows reserved device name (nul, con, aux, ...) which resolves to
+    # the device, not the on-disk file, under normal Win32 path semantics — so a
+    # plain Test-Path returns False even when the file exists.
+    $ntPath = "\\?\$PathToTest"
+    if (-not ([System.IO.File]::Exists($ntPath) -or [System.IO.Directory]::Exists($ntPath))) {
         return @{ Valid = $false; Reason = "Path does not exist" }
     }
 
@@ -481,13 +485,21 @@ function Backup-ReservedFile {
 function Move-ToRecycleBin {
     param([string]$FilePath)
 
+    $tempName = $null
     try {
         Add-Type -AssemblyName Microsoft.VisualBasic
         $ntPath = "\\?\$FilePath"
 
+        # Reserved device names cannot be recycled directly: a plain path resolves
+        # to the device, and FileSystem.DeleteFile rejects \\?\ paths. Rename to a
+        # normal name first (via the extended prefix), then recycle the renamed file.
+        $tempName = Join-Path (Split-Path $FilePath -Parent) ("__reserved_recycle_" + [System.IO.Path]::GetRandomFileName() + ".bin")
+        $ntTemp = "\\?\$tempName"
+        [System.IO.File]::Move($ntPath, $ntTemp)
+
         # FileSystem.DeleteFile with RecycleOption
         [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-            $FilePath,
+            $tempName,
             [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
             [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
         )
@@ -496,6 +508,10 @@ function Move-ToRecycleBin {
         return @{ Success = $true; Error = $null; Status = 'Recycled' }
     }
     catch {
+        # Don't leave the renamed temp file behind if recycling failed
+        if ($tempName -and [System.IO.File]::Exists("\\?\$tempName")) {
+            cmd /c "del /f /q /a `"$ntTemp`"" 2>$null
+        }
         # Fall back to cmd.exe deletion if recycle fails
         Write-Log "Recycle Bin failed, trying direct delete: $FilePath" 'WARN'
         return $null  # Signal to try regular deletion
@@ -602,8 +618,9 @@ function Remove-ReservedFile {
                 }
             }
 
-            # Verify the file was actually deleted
-            if (Test-Path -LiteralPath $FilePath) {
+            # Verify the file was actually deleted (use \\?\ so reserved device
+            # names are checked as files, not resolved to their devices)
+            if ([System.IO.File]::Exists("\\?\$FilePath")) {
                 return @{
                     Success = $false
                     Error   = "File still exists after deletion attempt. It may be locked or protected."

@@ -228,10 +228,17 @@ function Remove-ReservedFile {
         }
 
         if ($UseRecycleBin) {
+            $tempName = $null
             try {
                 Add-Type -AssemblyName Microsoft.VisualBasic
+                # Reserved device names cannot be recycled directly: a plain path
+                # resolves to the device, and FileSystem.DeleteFile rejects \\?\ paths.
+                # Rename to a normal name first (via the extended prefix), then recycle
+                # the renamed file.
+                $tempName = Join-Path (Split-Path $Path -Parent) ("__reserved_recycle_" + [System.IO.Path]::GetRandomFileName() + ".bin")
+                [System.IO.File]::Move($ntPath, "\\?\$tempName")
                 [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-                    $Path,
+                    $tempName,
                     [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
                     [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
                 )
@@ -240,7 +247,11 @@ function Remove-ReservedFile {
                 return $result
             }
             catch {
-                Write-Warning "Recycle Bin failed, trying direct delete"
+                # Don't leave the renamed temp file behind if recycling failed
+                if ($tempName -and [System.IO.File]::Exists("\\?\$tempName")) {
+                    cmd /c "del /f /q /a `"\\?\$tempName`"" 2>$null
+                }
+                Write-Warning "Recycle Bin failed, trying direct delete: $_"
             }
         }
 

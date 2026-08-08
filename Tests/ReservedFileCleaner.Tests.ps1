@@ -514,6 +514,40 @@ Describe "Remove-ReservedFile" {
             $backupFiles | Should -Not -BeNullOrEmpty
         }
     }
+
+    Context "Recycle Bin" {
+        BeforeEach {
+            $Script:CurrentTestDir = Join-Path $Script:RemoveTestDir "recycle-$(Get-Random)"
+            New-Item -Path $Script:CurrentTestDir -ItemType Directory -Force | Out-Null
+        }
+
+        AfterEach {
+            if (Test-Path $Script:CurrentTestDir) {
+                Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
+                Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        It "Should send a reserved-name file to the Recycle Bin when -UseRecycleBin is used (not permanently delete)" {
+            $nulPath = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul"
+            Test-ReservedFileExists -FilePath $nulPath | Should -BeTrue
+
+            # Measure Recycle Bin occupancy before deletion
+            $shell = New-Object -ComObject Shell.Application
+            $before = @($shell.Namespace(10).Items()).Count
+
+            $result = Remove-ReservedFile -Path $nulPath -UseRecycleBin -Force
+
+            Start-Sleep -Milliseconds 500
+            $after = @($shell.Namespace(10).Items()).Count
+
+            # File must be gone from its original location
+            Test-ReservedFileExists -FilePath $nulPath | Should -BeFalse
+            $result.Success | Should -BeTrue
+            # ...and genuinely recycled (recoverable), not permanently deleted
+            $after | Should -BeGreaterThan $before
+        }
+    }
 }
 
 Describe "Remove-ReservedFiles (Batch)" {
@@ -828,5 +862,50 @@ Describe "Edge Cases" {
                 Remove-Item -Path $isolatedDir2 -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+    }
+}
+
+Describe "Script Integration (Remove-ReservedFiles.ps1)" {
+    BeforeAll {
+        $Script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\Remove-ReservedFiles.ps1')).Path
+        # Prefer pwsh (PowerShell 7); fall back to Windows PowerShell 5.1
+        $Script:PsExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+    }
+
+    BeforeEach {
+        $Script:CurrentTestDir = Join-Path $env:TEMP "RFC-Script-$(Get-Random)"
+        New-Item -Path $Script:CurrentTestDir -ItemType Directory -Force | Out-Null
+    }
+
+    AfterEach {
+        if (Test-Path $Script:CurrentTestDir) {
+            Clear-ReservedTestFiles -Directory $Script:CurrentTestDir
+            Remove-Item -Path $Script:CurrentTestDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "Deletes a real reserved-name file found by the script (regression: Test-ValidPath must use \\?\)" {
+        $nulPath = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul"
+        Test-ReservedFileExists -FilePath $nulPath | Should -BeTrue
+
+        & $Script:PsExe -NoProfile -ExecutionPolicy Bypass -File $Script:ScriptPath -Path $Script:CurrentTestDir -Force -Quiet 2>&1 | Out-Null
+
+        Test-ReservedFileExists -FilePath $nulPath | Should -BeFalse
+    }
+
+    It "Recycles a real reserved-name file via the script -UseRecycleBin (regression: Move-ToRecycleBin rename-then-recycle)" {
+        $nulPath = New-ReservedTestFile -Directory $Script:CurrentTestDir -Name "nul"
+        Test-ReservedFileExists -FilePath $nulPath | Should -BeTrue
+
+        $shell = New-Object -ComObject Shell.Application
+        $before = @($shell.Namespace(10).Items()).Count
+
+        & $Script:PsExe -NoProfile -ExecutionPolicy Bypass -File $Script:ScriptPath -Path $Script:CurrentTestDir -UseRecycleBin -Force -Quiet 2>&1 | Out-Null
+
+        Start-Sleep -Milliseconds 500
+        $after = @($shell.Namespace(10).Items()).Count
+
+        Test-ReservedFileExists -FilePath $nulPath | Should -BeFalse
+        $after | Should -BeGreaterThan $before
     }
 }

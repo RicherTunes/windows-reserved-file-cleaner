@@ -5,7 +5,7 @@
     RootModule = 'ReservedFileCleaner.psm1'
 
     # Version number of this module
-    ModuleVersion = '1.2.0'
+    ModuleVersion = '1.2.1'
 
     # ID used to uniquely identify this module
     GUID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
@@ -76,6 +76,11 @@
 
             # Release notes for this module
             ReleaseNotes = @'
+v1.2.1 - Bug Fixes
+- Fix: reserved-name files can now be deleted (Test-ValidPath uses \\?\ prefix)
+- Fix: -UseRecycleBin truly recycles reserved-name files via rename-then-recycle
+- Added regression tests for deletion and recycling
+
 v1.1.0 - Safety & Automation Features
 - Recycle Bin support (-UseRecycleBin)
 - Backup before delete (-BackupPath)
